@@ -2,12 +2,16 @@
     'use strict';
 
     var PLUGIN_ID = 'plex_watchlist';
-    var VERSION = '0.1.0';
+    var VERSION = '0.2.0';
+    var PLEX = 'https://plex.tv';
     var DISCOVER = 'https://discover.provider.plex.tv';
     var METADATA = 'https://metadata.provider.plex.tv';
     var WATCHLIST_PATH = '/library/sections/watchlist/all';
     var CACHE_KEY = 'plex_watchlist_cache';
+    var CLIENT_ID_KEY = 'plex_watchlist_client_id';
     var PAGE_SIZE = 20;
+    var AUTH_POLL_INTERVAL = 3000;
+    var AUTH_TIMEOUT = 15 * 60 * 1000;
 
     var manifest = {
         type: 'other',
@@ -45,12 +49,36 @@
         return Lampa.Storage.get(name, def);
     }
 
+    function notify(text) {
+        Lampa.Noty.show(text);
+    }
+
     function token() {
         return (Lampa.Storage.get('plex_watchlist_token', '') || '').trim();
     }
 
-    function notify(text) {
-        Lampa.Noty.show(text);
+    function clientIdentifier() {
+        var id = Lampa.Storage.get(CLIENT_ID_KEY, '');
+
+        if (!id) {
+            id = 'lampa-plex-' + Date.now().toString(16) + '-' + Math.random().toString(16).slice(2);
+            Lampa.Storage.set(CLIENT_ID_KEY, id, true);
+        }
+
+        return id;
+    }
+
+    function plexHeaders(xhr, options) {
+        xhr.setRequestHeader('Accept', 'application/json');
+        xhr.setRequestHeader('X-Plex-Product', manifest.name);
+        xhr.setRequestHeader('X-Plex-Version', VERSION);
+        xhr.setRequestHeader('X-Plex-Client-Identifier', clientIdentifier());
+        xhr.setRequestHeader('X-Plex-Platform', 'Lampa');
+        xhr.setRequestHeader('X-Plex-Device', 'Lampa');
+        xhr.setRequestHeader('X-Plex-Device-Name', 'Lampa');
+
+        if (!options.noToken && token()) xhr.setRequestHeader('X-Plex-Token', token());
+        if (options.contentType) xhr.setRequestHeader('Content-Type', options.contentType);
     }
 
     function getCache() {
@@ -79,15 +107,15 @@
         return list.length ? '?' + list.join('&') : '';
     }
 
-    function request(method, url, params, success, fail) {
+    function request(method, url, params, success, fail, options) {
+        options = options || {};
+
         var xhr = new XMLHttpRequest();
         var full = url + qs(params || {});
 
         xhr.open(method, full, true);
         xhr.timeout = 20000;
-        xhr.setRequestHeader('Accept', 'application/json');
-
-        if (token()) xhr.setRequestHeader('X-Plex-Token', token());
+        plexHeaders(xhr, options);
 
         xhr.onreadystatechange = function () {
             if (xhr.readyState !== 4) return;
@@ -115,7 +143,7 @@
             if (fail) fail({ message: 'timeout' }, xhr);
         };
 
-        xhr.send();
+        xhr.send(options.body ? JSON.stringify(options.body) : null);
     }
 
     function asArray(value) {
@@ -802,6 +830,173 @@
         });
     }
 
+    function escapeHtml(text) {
+        return (text || '').toString().replace(/[&<>"']/g, function (char) {
+            return {
+                '&': '&amp;',
+                '<': '&lt;',
+                '>': '&gt;',
+                '"': '&quot;',
+                "'": '&#039;'
+            }[char];
+        });
+    }
+
+    function plexAuthUrl(code) {
+        return 'https://app.plex.tv/auth#' + qs({
+            clientID: clientIdentifier(),
+            code: code,
+            'context[device][product]': manifest.name,
+            'context[device][version]': VERSION,
+            forwardUrl: window.location.href
+        });
+    }
+
+    function openExternal(url) {
+        if (Lampa.Android && Lampa.Android.openBrowser) {
+            Lampa.Android.openBrowser(url);
+            return;
+        }
+
+        try {
+            window.open(url, '_blank');
+        } catch (e) {
+            var link = document.createElement('a');
+            link.href = url;
+            link.target = '_blank';
+            document.body.appendChild(link);
+            link.click();
+            link.remove();
+        }
+    }
+
+    function beginPlexLogin() {
+        Lampa.Loading.start();
+
+        request('POST', PLEX + '/api/v2/pins', {}, function (pin) {
+            Lampa.Loading.stop();
+
+            if (!pin || !pin.id || !pin.code) {
+                notify('Plex не вернул код входа');
+                return;
+            }
+
+            showPlexLogin(pin);
+        }, function () {
+            Lampa.Loading.stop();
+            notify('Не удалось создать код Plex');
+        }, {
+            noToken: true,
+            contentType: 'application/json'
+        });
+    }
+
+    function showPlexLogin(pin) {
+        var authUrl = plexAuthUrl(pin.code);
+        var linkUrl = 'https://plex.tv/link';
+        var timer = 0;
+        var started = Date.now();
+        var closed = false;
+        var html = $('<div class="account-modal-split plex-watchlist-login">' +
+            '<div class="account-modal-split__qr">' +
+                '<div class="account-modal-split__qr-code"></div>' +
+                '<div class="account-modal-split__qr-text">Сканируйте QR или откройте plex.tv/link</div>' +
+            '</div>' +
+            '<div class="account-modal-split__info">' +
+                '<div class="account-modal-split__title">Вход в Plex</div>' +
+                '<div class="account-modal-split__text">' +
+                    '<div style="font-size:3em;font-weight:700;letter-spacing:.18em;margin:.45em 0">' + escapeHtml(pin.code) + '</div>' +
+                    '<p>Откройте <b>plex.tv/link</b> на телефоне или компьютере, войдите в Plex и введите код.</p>' +
+                    '<p>После подтверждения Lampa сама сохранит токен аккаунта. Пароль Plex плагин не видит и не хранит.</p>' +
+                    '<p class="plex-watchlist-login__state">Жду подтверждение Plex...</p>' +
+                    '<p style="word-break:break-all">' + escapeHtml(linkUrl) + '</p>' +
+                '</div>' +
+            '</div>' +
+        '</div>');
+
+        function closeModal() {
+            if (closed) return;
+
+            closed = true;
+            clearInterval(timer);
+
+            if (Lampa.Modal && Lampa.Modal.close) Lampa.Modal.close();
+        }
+
+        function checkPin() {
+            if (closed) return;
+
+            if (Date.now() - started > AUTH_TIMEOUT) {
+                html.find('.plex-watchlist-login__state').text('Код устарел. Создайте новый код входа.');
+                clearInterval(timer);
+                return;
+            }
+
+            request('GET', PLEX + '/api/v2/pins/' + encodeURIComponent(pin.id), {
+                code: pin.code
+            }, function (data) {
+                if (!data || !data.authToken) return;
+
+                Lampa.Storage.set('plex_watchlist_token', data.authToken);
+                Lampa.Storage.set('plex_watchlist_auth_at', Date.now(), true);
+
+                html.find('.plex-watchlist-login__state').text('Plex подключен');
+                notify('Plex подключен');
+                closeModal();
+                testConnection();
+            }, function () {
+                html.find('.plex-watchlist-login__state').text('Не удалось проверить код. Пробую ещё раз...');
+            }, {
+                noToken: true
+            });
+        }
+
+        if (Lampa.Utils && Lampa.Utils.qrcode) {
+            Lampa.Utils.qrcode(authUrl, html.find('.account-modal-split__qr-code'), function () {
+                html.find('.account-modal-split__qr-code').text(pin.code);
+            });
+        } else {
+            html.find('.account-modal-split__qr-code').text(pin.code);
+        }
+
+        if (Lampa.Modal && Lampa.Modal.open) {
+            Lampa.Modal.open({
+                title: '',
+                html: html,
+                size: 'full',
+                scroll: {
+                    nopadding: true
+                },
+                buttons: [
+                    {
+                        name: 'Открыть Plex',
+                        onSelect: function () {
+                            openExternal(authUrl);
+                        }
+                    },
+                    {
+                        name: 'Закрыть',
+                        onSelect: closeModal
+                    }
+                ],
+                buttons_position: 'outside',
+                onBack: closeModal
+            });
+        } else {
+            notify('Plex код: ' + pin.code + '. Откройте plex.tv/link');
+            openExternal(authUrl);
+        }
+
+        timer = setInterval(checkPin, AUTH_POLL_INTERVAL);
+        checkPin();
+    }
+
+    function logoutPlex() {
+        Lampa.Storage.set('plex_watchlist_token', '');
+        Lampa.Storage.set(CACHE_KEY, {});
+        notify('Plex token удалён');
+    }
+
     function registerSettings() {
         Lampa.SettingsApi.addComponent({
             component: PLUGIN_ID,
@@ -822,6 +1017,21 @@
         Lampa.SettingsApi.addParam({
             component: PLUGIN_ID,
             param: {
+                type: 'button',
+                name: 'plex_watchlist_login'
+            },
+            field: {
+                name: 'Войти через Plex',
+                description: 'Откроет вход по коду без ручного поиска токена'
+            },
+            onChange: function () {
+                beginPlexLogin();
+            }
+        });
+
+        Lampa.SettingsApi.addParam({
+            component: PLUGIN_ID,
+            param: {
                 name: 'plex_watchlist_token',
                 type: 'input',
                 values: '',
@@ -829,7 +1039,7 @@
             },
             field: {
                 name: 'X-Plex-Token',
-                description: 'Токен аккаунта Plex для Discover/Watchlist'
+                description: 'Заполняется автоматически после входа через Plex; можно вставить вручную'
             }
         });
 
@@ -844,6 +1054,21 @@
             },
             onChange: function () {
                 testConnection();
+            }
+        });
+
+        Lampa.SettingsApi.addParam({
+            component: PLUGIN_ID,
+            param: {
+                type: 'button',
+                name: 'plex_watchlist_logout'
+            },
+            field: {
+                name: 'Выйти из Plex',
+                description: 'Удалить сохранённый token и кэш Plex'
+            },
+            onChange: function () {
+                logoutPlex();
             }
         });
 

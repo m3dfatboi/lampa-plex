@@ -7,14 +7,18 @@
 - Добавляет пункт `Plex Watchlist` в боковое меню Lampa.
 - Показывает Watchlist из Plex отдельным нативным разделом Lampa.
 - Добавляет пункт `Добавить в Plex Watchlist` в меню действий карточки.
+- Авторизуется в Plex по коду через официальный PIN-flow, без ручного поиска токена.
 - Может отмечать фильмы и серии как просмотренные в Plex, когда прогресс Lampa достигает выбранного порога.
 
 ## Настройка
 
 1. Подключи `plex-watchlist.js` как обычный плагин Lampa.
 2. Открой `Настройки -> Plex Watchlist`.
-3. Укажи `X-Plex-Token` своего аккаунта Plex.
-4. Нажми `Проверить подключение`.
+3. Нажми `Войти через Plex`.
+4. Открой `plex.tv/link` на телефоне или компьютере, войди в Plex и введи код из Lampa.
+5. После подтверждения плагин сам сохранит `X-Plex-Token`; нажми `Проверить подключение`.
+
+Поле `X-Plex-Token` оставлено как запасной ручной способ. Его можно получить в Plex Web через `View XML` у любого элемента библиотеки и скопировать параметр `X-Plex-Token` из URL.
 
 ## Ссылка
 
@@ -38,3 +42,4 @@
 - `https://discover.provider.plex.tv/actions/removeFromWatchlist`
 - `https://metadata.provider.plex.tv/actions/scrobble`
 - `https://metadata.provider.plex.tv/library/metadata/{ratingKey}/userState`
+- `https://plex.tv/api/v2/pins`
