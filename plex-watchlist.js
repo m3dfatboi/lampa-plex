@@ -2,7 +2,7 @@
     'use strict';
 
     var PLUGIN_ID = 'plex_watchlist';
-    var VERSION = '0.4.5';
+    var VERSION = '0.4.6';
     var WATCHLIST_TITLE = 'Очередь';
     var WATCHLIST_FROM_TITLE = 'Очереди';
     var PLEX = 'https://plex.tv';
@@ -12,12 +12,13 @@
     var COMMUNITY = 'https://community.plex.tv';
     var WATCHLIST_PATH = '/library/sections/watchlist/all';
     var CACHE_KEY = 'plex_watchlist_cache';
-    var CACHE_SCHEMA = 6;
+    var CACHE_SCHEMA = 7;
     var CLIENT_ID_KEY = 'plex_watchlist_client_id';
     var PAGE_SIZE = 20;
     var PLEX_ROW_SIZE = 24;
     var WATCHED_SNAPSHOT_SIZE = 100;
-    var WATCHED_SNAPSHOT_TTL = 6 * 60 * 60 * 1000;
+    var WATCHED_SNAPSHOT_TTL = 2 * 60 * 1000;
+    var PLEX_STATE_TTL = 45 * 1000;
     var LAMPA_CARD_CONCURRENCY = 4;
     var AUTH_POLL_INTERVAL = 3000;
     var AUTH_TIMEOUT = 15 * 60 * 1000;
@@ -110,6 +111,11 @@
         if (cache.schema !== CACHE_SCHEMA) {
             cache.lampa = {};
             cache.watched = {};
+            cache.watched_checked = {};
+            cache.ratings = {};
+            cache.ratings_checked = {};
+            cache.state_checked = {};
+            cache.state_loading = {};
             cache.watched_loaded = 0;
             cache.watched_loading = false;
             cache.schema = CACHE_SCHEMA;
@@ -122,9 +128,17 @@
         cache.lampa = cache.lampa || {};
         cache.episodes = cache.episodes || {};
         cache.watched = cache.watched || {};
+        cache.watched_checked = cache.watched_checked || {};
+        cache.ratings = cache.ratings || {};
+        cache.ratings_checked = cache.ratings_checked || {};
+        cache.state_checked = cache.state_checked || {};
+        cache.state_loading = cache.state_loading || {};
         cache.watched_loaded = cache.watched_loaded || 0;
         cache.watched_loading = cache.watched_loading || false;
         if (cache.watched_loading && Date.now() - cache.watched_loading > 2 * 60 * 1000) cache.watched_loading = false;
+        Object.keys(cache.state_loading).forEach(function (key) {
+            if (Date.now() - cache.state_loading[key] > 2 * 60 * 1000) delete cache.state_loading[key];
+        });
         cache.account = cache.account || {};
 
         return cache;
@@ -321,6 +335,17 @@
         return isUserStateWatchlisted(state) || !!item.watchlistedAt;
     }
 
+    function metadataUserRating(item) {
+        if (!item) return 0;
+
+        var state = item.UserState || item.userState || {};
+        if (Array.isArray(state)) state = state[0] || {};
+
+        if (item.userRating !== undefined && item.userRating !== null && item.userRating !== '') return parsePlexRating(item.userRating);
+
+        return userStateRating(state);
+    }
+
     function episodeLabel(season, episode) {
         if (!season && !episode) return '';
         if (season && episode) return 'S' + season + ' E' + episode;
@@ -510,6 +535,23 @@
         };
     }
 
+    function ratingKeyForCard(card) {
+        var direct = plexItemFromCard(card);
+        var cached = getCache().items[cardKey(card)];
+
+        if (direct && direct.ratingKey) return direct.ratingKey;
+        if (cached && cached.ratingKey) return cached.ratingKey;
+
+        return '';
+    }
+
+    function cachedPlexItemForCard(card) {
+        var direct = plexItemFromCard(card);
+        var cached = getCache().items[cardKey(card)];
+
+        return direct || cached || null;
+    }
+
     function resolvePlexItem(card, success, fail) {
         var cache = getCache();
         var key = cardKey(card);
@@ -546,19 +588,69 @@
         }, fail);
     }
 
+    function mergeUserState(primary, meta) {
+        var state = {};
+        var nested;
+        var key;
+
+        primary = Array.isArray(primary) ? primary[0] || {} : primary || {};
+        meta = meta || {};
+        nested = Array.isArray(meta.UserState) ? meta.UserState[0] || {} : meta.UserState || {};
+
+        for (key in nested) {
+            if (nested.hasOwnProperty(key)) state[key] = nested[key];
+        }
+
+        for (key in primary) {
+            if (primary.hasOwnProperty(key)) state[key] = primary[key];
+        }
+
+        if (meta.userRating !== undefined && meta.userRating !== null && meta.userRating !== '') state.userRating = meta.userRating;
+        if (meta.viewCount !== undefined && state.viewCount === undefined) state.viewCount = meta.viewCount;
+        if (meta.lastViewedAt !== undefined && state.lastViewedAt === undefined) state.lastViewedAt = meta.lastViewedAt;
+
+        return state;
+    }
+
     function userState(ratingKey, success, fail) {
         request('GET', METADATA + '/library/metadata/' + encodeURIComponent(ratingKey) + '/userState', {}, function (data) {
             var box = mediaContainer(data);
-            var state = box.UserState || {};
             var meta = asArray(box.Metadata)[0] || {};
 
-            if (Array.isArray(state)) state = state[0] || {};
-            if (!state.watchlistedAt && meta.UserState) {
-                state = Array.isArray(meta.UserState) ? meta.UserState[0] || {} : meta.UserState;
+            success(mergeUserState(box.UserState, meta), meta);
+        }, fail);
+    }
+
+    function metadataState(ratingKey, success, fail) {
+        request('GET', METADATA + '/library/metadata/' + encodeURIComponent(ratingKey), {
+            includeUserState: 1
+        }, function (data) {
+            var meta = collectMetadata(data)[0] || {};
+
+            success(mergeUserState(meta.UserState, meta), meta);
+        }, fail);
+    }
+
+    function hasRatingField(state) {
+        return !!(state && (
+            state.userRating !== undefined && state.userRating !== null && state.userRating !== '' ||
+            state.rating !== undefined && state.rating !== null && state.rating !== ''
+        ));
+    }
+
+    function loadPlexRatingState(ratingKey, success, fail) {
+        userState(ratingKey, function (state, meta) {
+            if (hasRatingField(state)) {
+                success(state, meta);
+                return;
             }
 
-            success(state);
-        }, fail);
+            metadataState(ratingKey, success, function () {
+                success(state, meta);
+            });
+        }, function () {
+            metadataState(ratingKey, success, fail);
+        });
     }
 
     function isCachedWatchlisted(ratingKey) {
@@ -594,9 +686,50 @@
         return !!(cached && cached.ratingKey && cache.watched[cached.ratingKey]);
     }
 
-    function setCachedWatchlisted(ratingKey, status) {
+    function parsePlexRating(value) {
+        var rating = parseFloat(value);
+
+        if (!isFinite(rating) || rating <= 0) return 0;
+
+        return Math.round(rating * 10) / 10;
+    }
+
+    function userStateRating(state) {
+        if (!state) return 0;
+        if (state.userRating !== undefined && state.userRating !== null && state.userRating !== '') return parsePlexRating(state.userRating);
+        if (state.rating !== undefined && state.rating !== null && state.rating !== '') return parsePlexRating(state.rating);
+        return 0;
+    }
+
+    function cachedRatingForCard(card) {
+        var cache = getCache();
+        var key = ratingKeyForCard(card);
+        var value;
+
+        if (card && card.plex_rating) return parsePlexRating(card.plex_rating);
+        if (!key) return 0;
+
+        value = cache.ratings[key];
+
+        return value ? parsePlexRating(value) : 0;
+    }
+
+    function formatPlexRating(rating) {
+        rating = parsePlexRating(rating);
+
+        return rating % 1 === 0 ? parseInt(rating, 10) + '/10' : rating + '/10';
+    }
+
+    function plexRatingActionTitle(card) {
+        var rating = cachedRatingForCard(card);
+
+        return rating ? 'Изменить оценку (' + formatPlexRating(rating) + ')' : 'Оценить на Plex';
+    }
+
+    function setCachedWatchlisted(ratingKey, status, options) {
         var cache = getCache();
 
+        options = options || {};
         cache.watchlist_checked[ratingKey] = Date.now();
 
         if (status) {
@@ -608,19 +741,38 @@
         }
 
         saveCache(cache);
-        schedulePlexMarkerScan();
+        if (options.scan !== false) schedulePlexMarkerScan();
     }
 
-    function setCachedWatched(ratingKey, status) {
+    function setCachedWatched(ratingKey, status, options) {
         if (!ratingKey) return;
 
         var cache = getCache();
+
+        options = options || {};
+        cache.watched_checked[ratingKey] = Date.now();
 
         if (status) cache.watched[ratingKey] = Date.now();
         else delete cache.watched[ratingKey];
 
         saveCache(cache);
-        schedulePlexMarkerScan();
+        if (options.scan !== false) schedulePlexMarkerScan();
+    }
+
+    function setCachedRating(ratingKey, rating, options) {
+        if (!ratingKey) return;
+
+        var cache = getCache();
+        var value = parsePlexRating(rating);
+
+        options = options || {};
+        cache.ratings_checked[ratingKey] = Date.now();
+
+        if (value) cache.ratings[ratingKey] = value;
+        else delete cache.ratings[ratingKey];
+
+        saveCache(cache);
+        if (options.scan !== false) schedulePlexMarkerScan();
     }
 
     function isUserStateWatchlisted(state) {
@@ -635,6 +787,19 @@
         return onList;
     }
 
+    function syncCachedPlexState(ratingKey, state, item, options) {
+        var watched = stateWatched(state, item);
+        var rating = hasRatingField(state) ? userStateRating(state) : 0;
+
+        setCachedWatched(ratingKey, watched, options);
+        if (hasRatingField(state)) setCachedRating(ratingKey, rating, options);
+
+        return {
+            watched: watched,
+            rating: rating
+        };
+    }
+
     function watchedSnapshotFresh(cache) {
         return !!(cache && cache.watched_loaded && Date.now() - cache.watched_loaded < WATCHED_SNAPSHOT_TTL);
     }
@@ -642,6 +807,9 @@
     function rememberWatchedItems(items) {
         var cache = getCache();
         var cards = [];
+
+        cache.watched = {};
+        cache.watched_checked = {};
 
         asArray(items).forEach(function (item) {
             var card = plexToLampaCard(item);
@@ -654,7 +822,10 @@
             cards.push(card);
 
             direct = plexItemFromCard(card);
-            if (direct && direct.ratingKey) cache.watched[direct.ratingKey] = Date.now();
+            if (direct && direct.ratingKey) {
+                cache.watched[direct.ratingKey] = Date.now();
+                cache.watched_checked[direct.ratingKey] = Date.now();
+            }
         });
 
         cache.watched_loaded = Date.now();
@@ -1538,7 +1709,14 @@
 
             cache.items[cardKey(card)] = direct;
 
-            if (card.plex_watched) cache.watched[direct.ratingKey] = Date.now();
+            if (card.plex_watched) {
+                cache.watched[direct.ratingKey] = Date.now();
+                cache.watched_checked[direct.ratingKey] = Date.now();
+            }
+            if (card.plex_rating) {
+                cache.ratings[direct.ratingKey] = parsePlexRating(card.plex_rating);
+                cache.ratings_checked[direct.ratingKey] = Date.now();
+            }
             if (card.plex_watchlisted) {
                 cache.watchlist[direct.ratingKey] = Date.now();
                 cache.watchlist_checked[direct.ratingKey] = Date.now();
@@ -1590,6 +1768,7 @@
         if (isCardWatched(card) || card.plex_watched) addCardIcon(element, 'history');
         if (card.plex_episode_label) addEpisodeBadge(element, card.plex_episode_label);
         if (card.plex_episode_air_date_label) addEpisodeAirDate(element, card.plex_episode_air_date_label);
+        refreshVisiblePlexState(element, card);
     }
 
     function addCardIcon(element, name) {
@@ -1602,6 +1781,55 @@
 
         icon.className = 'card__icon icon--' + name + ' plex-watchlist-icon plex-watchlist-icon--' + name;
         inner.appendChild(icon);
+    }
+
+    function removeCardIcon(element, name) {
+        var icon = element && element.querySelector ? element.querySelector('.card__icons-inner .icon--' + name) : null;
+
+        if (icon && icon.parentNode) icon.parentNode.removeChild(icon);
+    }
+
+    function updateWatchedIcon(element, card, watched) {
+        card.plex_watched = !!watched;
+
+        if (watched) addCardIcon(element, 'history');
+        else removeCardIcon(element, 'history');
+    }
+
+    function refreshVisiblePlexState(element, card) {
+        var key;
+        var cache;
+
+        if (!token() || !card || !element) return;
+
+        key = ratingKeyForCard(card);
+        if (!key) return;
+
+        cache = getCache();
+
+        if (cache.state_loading[key]) return;
+        if (cache.state_checked[key] && Date.now() - cache.state_checked[key] < PLEX_STATE_TTL) return;
+
+        cache.state_loading[key] = Date.now();
+        saveCache(cache);
+
+        userState(key, function (state) {
+            var sync = syncCachedPlexState(key, state, cachedPlexItemForCard(card), {
+                scan: false
+            });
+
+            cache = getCache();
+            delete cache.state_loading[key];
+            cache.state_checked[key] = Date.now();
+            saveCache(cache);
+
+            updateWatchedIcon(element, card, sync.watched);
+        }, function () {
+            cache = getCache();
+            delete cache.state_loading[key];
+            cache.state_checked[key] = Date.now();
+            saveCache(cache);
+        });
     }
 
     function addEpisodeBadge(element, label) {
@@ -1653,6 +1881,13 @@
         plexMarkerScanTimer = setTimeout(scanPlexMarkers, 350);
     }
 
+    function resetPlexStateThrottle() {
+        var cache = getCache();
+
+        cache.state_checked = {};
+        saveCache(cache);
+    }
+
     function registerPlexMarkers() {
         loadWatchedSnapshot(function () {
             schedulePlexMarkerScan();
@@ -1660,7 +1895,10 @@
 
         if (Lampa.Listener && Lampa.Listener.follow) {
             Lampa.Listener.follow('activity', function (event) {
-                if (event && (event.type == 'create' || event.type == 'start')) schedulePlexMarkerScan();
+                if (event && (event.type == 'create' || event.type == 'start')) {
+                    resetPlexStateThrottle();
+                    schedulePlexMarkerScan();
+                }
             });
 
             Lampa.Listener.follow('state:changed', function () {
@@ -1821,7 +2059,7 @@
             });
 
             actions.push({
-                title: 'Оценить на Plex',
+                title: plexRatingActionTitle(card),
                 subtitle: 'Отметит просмотренным',
                 plex_watchlist_rate_action: true,
                 onSelect: function () {
@@ -1955,11 +2193,45 @@
             else return;
         }
 
+        setRateButtonState(button, cachedRatingForCard(card));
+        refreshRateButton(button, card);
+
         button.on('hover:enter', function () {
             showPlexRatingSelect(card);
         });
 
         bindFullButtonLast(event, button);
+    }
+
+    function setRateButtonState(button, rating) {
+        var text = button.find('span').first();
+
+        if (!text.length) {
+            button.append('<span></span>');
+            text = button.find('span').first();
+        }
+
+        text.text(rating ? 'Изменить оценку (' + formatPlexRating(rating) + ')' : 'Оценить на Plex');
+    }
+
+    function refreshRateButton(button, card) {
+        var key;
+
+        if (!token()) return;
+
+        resolvePlexItem(card, function (item) {
+            key = item.ratingKey;
+
+            loadPlexRatingState(key, function (state) {
+                var rating = userStateRating(state);
+
+                setCachedRating(key, rating, {
+                    scan: false
+                });
+                card.plex_rating = rating;
+                setRateButtonState(button, rating);
+            });
+        });
     }
 
     function registerFullButtons() {
@@ -2020,6 +2292,11 @@
 
         resolvePlexItem(card, function (item) {
             ratePlexItem(item.ratingKey, rating, function () {
+                setCachedRating(item.ratingKey, rating, {
+                    scan: false
+                });
+                card.plex_rating = rating;
+
                 markPlayed(item.ratingKey, function () {
                     Lampa.Loading.stop();
                     notify('Оценка Plex сохранена, просмотр отмечен');
@@ -2801,6 +3078,7 @@
             source: 'tmdb',
             year: year,
             plex_watched: metadataWatched(item),
+            plex_rating: metadataUserRating(item),
             plex_watchlisted: metadataWatchlisted(item)
         };
 
