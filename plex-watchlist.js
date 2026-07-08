@@ -2,7 +2,8 @@
     'use strict';
 
     var PLUGIN_ID = 'plex_watchlist';
-    var VERSION = '0.2.0';
+    var VERSION = '0.3.0';
+    var WATCHLIST_TITLE = 'Буду смотреть';
     var PLEX = 'https://plex.tv';
     var DISCOVER = 'https://discover.provider.plex.tv';
     var METADATA = 'https://metadata.provider.plex.tv';
@@ -22,6 +23,9 @@
     };
 
     var icon = '<svg viewBox="0 0 256 256" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M50 28h54l102 100-102 100H50l102-100L50 28Z" fill="currentColor"/></svg>';
+    var settingsIcon = '<svg width="38" height="38" viewBox="0 0 256 256" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M50 28h54l102 100-102 100H50l102-100L50 28Z" fill="white"/></svg>';
+    var watchlistButtonIcon = '<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M7 4.75c0-.69.56-1.25 1.25-1.25h7.5c.69 0 1.25.56 1.25 1.25v14.5l-5-2.85-5 2.85V4.75Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg>';
+    var rateButtonIcon = '<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="m12 3.7 2.43 4.93 5.45.79-3.94 3.84.93 5.42L12 16.12l-4.87 2.56.93-5.42-3.94-3.84 5.45-.79L12 3.7Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg>';
     var playbackByHash = {};
     var pendingSync = {};
     var currentCard = null;
@@ -36,6 +40,7 @@
         registerRoute();
         registerMenu();
         registerContextAction();
+        registerFullButtons();
         registerPlaybackSync();
 
         console.log('Plex Watchlist', 'started', VERSION);
@@ -86,6 +91,7 @@
 
         cache.items = cache.items || {};
         cache.watchlist = cache.watchlist || {};
+        cache.watchlist_removed = cache.watchlist_removed || {};
         cache.episodes = cache.episodes || {};
 
         return cache;
@@ -259,9 +265,29 @@
         return best || results[0];
     }
 
+    function plexItemFromCard(card) {
+        if (!card || !card.plex_rating_key) return null;
+
+        return {
+            ratingKey: card.plex_rating_key,
+            guid: card.plex_guid || '',
+            type: cardType(card) == 'show' ? 'show' : 'movie',
+            title: cardTitle(card),
+            year: releaseYear(card)
+        };
+    }
+
     function resolvePlexItem(card, success, fail) {
         var cache = getCache();
         var key = cardKey(card);
+        var direct = plexItemFromCard(card);
+
+        if (direct && direct.ratingKey) {
+            cache.items[key] = direct;
+            saveCache(cache);
+            success(direct);
+            return;
+        }
 
         if (cache.items[key] && cache.items[key].ratingKey) {
             success(cache.items[key]);
@@ -307,11 +333,33 @@
         return !!cache.watchlist[ratingKey];
     }
 
+    function isCachedWatchlistRemoved(ratingKey) {
+        var cache = getCache();
+        return !!cache.watchlist_removed[ratingKey];
+    }
+
+    function isCardWatchlisted(card) {
+        var direct = plexItemFromCard(card);
+        var cached = getCache().items[cardKey(card)];
+
+        if (direct && direct.ratingKey) {
+            if (isCachedWatchlistRemoved(direct.ratingKey)) return false;
+            return isCachedWatchlisted(direct.ratingKey) || String(card.id || '').indexOf('plex_') === 0;
+        }
+
+        return !!(cached && cached.ratingKey && isCachedWatchlisted(cached.ratingKey));
+    }
+
     function setCachedWatchlisted(ratingKey, status) {
         var cache = getCache();
 
-        if (status) cache.watchlist[ratingKey] = Date.now();
-        else delete cache.watchlist[ratingKey];
+        if (status) {
+            cache.watchlist[ratingKey] = Date.now();
+            delete cache.watchlist_removed[ratingKey];
+        } else {
+            delete cache.watchlist[ratingKey];
+            cache.watchlist_removed[ratingKey] = Date.now();
+        }
 
         saveCache(cache);
     }
@@ -337,21 +385,33 @@
         }, success || function () {}, fail);
     }
 
-    function toggleCardWatchlist(card) {
+    function ratePlexItem(ratingKey, rating, success, fail) {
+        request('PUT', METADATA + '/:/rate', {
+            key: ratingKey,
+            identifier: 'com.plexapp.plugins.library',
+            rating: rating
+        }, success || function () {}, fail);
+    }
+
+    function toggleCardWatchlist(card, doneCallback, options) {
         if (!token()) {
             notify('Укажи Plex token в настройках');
             return;
         }
 
+        options = options || {};
         Lampa.Loading.start();
 
         resolvePlexItem(card, function (item) {
             userState(item.ratingKey, function (state) {
-                var onList = !!(state.watchlistedAt || state.watchlist || isCachedWatchlisted(item.ratingKey));
+                var onList = !!(state.watchlistedAt || state.watchlist || isCachedWatchlisted(item.ratingKey) || isCardWatchlisted(card));
                 var done = function () {
+                    var newStatus = !onList;
+
                     Lampa.Loading.stop();
-                    notify(onList ? 'Удалено из Plex Watchlist' : 'Добавлено в Plex Watchlist');
-                    Lampa.Activity.refresh();
+                    notify(onList ? 'Удалено из ' + WATCHLIST_TITLE : 'Добавлено в ' + WATCHLIST_TITLE);
+                    if (doneCallback) doneCallback(newStatus, item);
+                    if (options.refresh !== false) Lampa.Activity.refresh();
                 };
                 var bad = function () {
                     Lampa.Loading.stop();
@@ -361,10 +421,14 @@
                 if (onList) removeFromWatchlist(item.ratingKey, done, bad);
                 else addToWatchlist(item.ratingKey, done, bad);
             }, function () {
-                var onList = isCachedWatchlisted(item.ratingKey);
+                var onList = isCachedWatchlisted(item.ratingKey) || isCardWatchlisted(card);
                 var done = function () {
+                    var newStatus = !onList;
+
                     Lampa.Loading.stop();
-                    notify(onList ? 'Удалено из Plex Watchlist' : 'Добавлено в Plex Watchlist');
+                    notify(onList ? 'Удалено из ' + WATCHLIST_TITLE : 'Добавлено в ' + WATCHLIST_TITLE);
+                    if (doneCallback) doneCallback(newStatus, item);
+                    if (options.refresh !== false) Lampa.Activity.refresh();
                 };
                 var bad = function () {
                     Lampa.Loading.stop();
@@ -393,16 +457,10 @@
 
             active.plexWatchlistInjected = true;
 
-            var cached = getCache().items[cardKey(card)];
-            var onList = cached && cached.ratingKey ? isCachedWatchlisted(cached.ratingKey) : false;
+            var onList = isCardWatchlisted(card);
 
-            active.items.push({
-                title: 'Plex',
-                separator: true
-            });
-
-            active.items.push({
-                title: onList ? 'Удалить из Plex Watchlist' : 'Добавить в Plex Watchlist',
+            active.items.unshift({
+                title: onList ? 'Удалить из ' + WATCHLIST_TITLE : 'Добавить в ' + WATCHLIST_TITLE,
                 subtitle: 'Plex Discover',
                 plex_watchlist_action: true,
                 onSelect: function () {
@@ -431,6 +489,175 @@
         }
 
         return currentCard;
+    }
+
+    function fullEventCard(event) {
+        if (!event) return null;
+        if (event.data && event.data.movie) return event.data.movie;
+        if (event.object && event.object.movie) return event.object.movie;
+        if (event.object && event.object.card) return event.object.card;
+        return currentCard;
+    }
+
+    function fullEventBody(event) {
+        if (event && event.body && event.body.find) return event.body;
+
+        if (event && event.object && event.object.activity && event.object.activity.render) {
+            return event.object.activity.render();
+        }
+
+        return $();
+    }
+
+    function setFullWatchlistButtonState(button, onList) {
+        var label = onList ? 'Удалить из ' + WATCHLIST_TITLE : 'В ' + WATCHLIST_TITLE;
+        var text = button.find('span').first();
+
+        if (!text.length) {
+            button.append('<span></span>');
+            text = button.find('span').first();
+        }
+
+        text.text(label);
+        button.toggleClass('active', !!onList);
+    }
+
+    function refreshFullWatchlistButton(button, card) {
+        setFullWatchlistButtonState(button, isCardWatchlisted(card));
+
+        if (!token()) return;
+
+        resolvePlexItem(card, function (item) {
+            userState(item.ratingKey, function (state) {
+                setFullWatchlistButtonState(button, !!(state.watchlistedAt || state.watchlist || isCachedWatchlisted(item.ratingKey) || isCardWatchlisted(card)));
+            });
+        });
+    }
+
+    function bindFullButtonLast(event, button) {
+        button.on('hover:focus hover:enter hover:hover hover:touch', function (e) {
+            if (event.link && event.link.items && event.link.items[0]) event.link.items[0].last = e.target;
+        });
+    }
+
+    function replaceFavoriteButton(event, card, body) {
+        var button = body.find('.button--book').first();
+
+        if (!button.length || button.hasClass('button--plex-watchlist')) return button;
+
+        button.off('hover:enter').removeClass('button--book').addClass('button--plex-watchlist').attr('data-subtitle', 'Plex');
+
+        if (button.find('svg').length) button.find('svg').first().replaceWith(watchlistButtonIcon);
+        else button.prepend(watchlistButtonIcon);
+
+        setFullWatchlistButtonState(button, isCardWatchlisted(card));
+        refreshFullWatchlistButton(button, card);
+
+        button.on('hover:enter', function () {
+            toggleCardWatchlist(card, function (status) {
+                setFullWatchlistButtonState(button, status);
+            }, {
+                refresh: false
+            });
+        });
+
+        bindFullButtonLast(event, button);
+
+        return button;
+    }
+
+    function addRateButton(event, card, body, anchor) {
+        if (body.find('.button--plex-rate').length) return;
+
+        var button = $('<div class="full-start__button selector button--plex-rate" data-subtitle="Plex">' + rateButtonIcon + '<span>Оценить на Plex</span></div>');
+
+        if (anchor && anchor.length) anchor.after(button);
+        else {
+            var box = body.find('.full-start-new__buttons, .buttons--container').first();
+            if (box.length) box.append(button);
+            else return;
+        }
+
+        button.on('hover:enter', function () {
+            showPlexRatingSelect(card);
+        });
+
+        bindFullButtonLast(event, button);
+    }
+
+    function registerFullButtons() {
+        if (!Lampa.Listener || !Lampa.Listener.follow) return;
+
+        Lampa.Listener.follow('full', function (event) {
+            if (!event || event.type != 'complite') return;
+
+            var card = fullEventCard(event);
+            var body = fullEventBody(event);
+
+            if (!card || !cardTitle(card) || !body.length || body.data('plex-watchlist-full')) return;
+
+            body.data('plex-watchlist-full', true);
+
+            var watchlistButton = replaceFavoriteButton(event, card, body);
+            addRateButton(event, card, body, watchlistButton);
+        });
+    }
+
+    function showPlexRatingSelect(card) {
+        if (!Lampa.Select || !Lampa.Select.show) return;
+
+        if (!token()) {
+            notify('Укажи Plex token в настройках');
+            return;
+        }
+
+        var items = [];
+
+        for (var i = 10; i >= 1; i--) {
+            items.push({
+                title: i + ' / 10',
+                rating: i
+            });
+        }
+
+        Lampa.Select.show({
+            title: 'Оценить на Plex',
+            items: items,
+            onBack: function () {
+                Lampa.Controller.toggle('content');
+            },
+            onSelect: function (item) {
+                Lampa.Controller.toggle('content');
+                if (item) rateCardOnPlex(card, item.rating);
+            }
+        });
+    }
+
+    function rateCardOnPlex(card, rating) {
+        if (!token()) {
+            notify('Укажи Plex token в настройках');
+            return;
+        }
+
+        Lampa.Loading.start();
+
+        resolvePlexItem(card, function (item) {
+            ratePlexItem(item.ratingKey, rating, function () {
+                markPlayed(item.ratingKey, function () {
+                    Lampa.Loading.stop();
+                    notify('Оценка Plex сохранена, просмотр отмечен');
+                }, function () {
+                    Lampa.Loading.stop();
+                    notify('Оценка Plex сохранена, но просмотр не отмечен');
+                });
+            }, function () {
+                Lampa.Loading.stop();
+                notify('Plex: не удалось сохранить оценку');
+            });
+        }, function () {
+            Lampa.Loading.stop();
+            notify('Не нашел этот тайтл в Plex Discover');
+        });
     }
 
     function registerPlaybackSync() {
@@ -660,7 +887,7 @@
         if (Lampa.Router && Lampa.Router.add) {
             Lampa.Router.add(PLUGIN_ID, function (data) {
                 return {
-                    title: data.title || 'Plex Watchlist',
+                    title: data.title || WATCHLIST_TITLE,
                     page: data.page || 1
                 };
             });
@@ -668,7 +895,7 @@
     }
 
     function registerMenu() {
-        Lampa.Menu.addButton(icon, 'Plex Watchlist', function () {
+        Lampa.Menu.addButton(icon, WATCHLIST_TITLE, function () {
             openWatchlist();
         }).attr('data-action', PLUGIN_ID);
     }
@@ -676,12 +903,12 @@
     function openWatchlist() {
         if (Lampa.Router && Lampa.Router.call) {
             Lampa.Router.call(PLUGIN_ID, {
-                title: 'Plex Watchlist'
+                title: WATCHLIST_TITLE
             });
         } else {
             Lampa.Activity.push({
                 component: PLUGIN_ID,
-                title: 'Plex Watchlist',
+                title: WATCHLIST_TITLE,
                 page: 1
             });
         }
@@ -744,7 +971,10 @@
         var cache = getCache();
 
         items.forEach(function (item) {
-            if (item.plex_rating_key) cache.watchlist[item.plex_rating_key] = Date.now();
+            if (item.plex_rating_key) {
+                cache.watchlist[item.plex_rating_key] = Date.now();
+                delete cache.watchlist_removed[item.plex_rating_key];
+            }
         });
 
         saveCache(cache);
@@ -1000,8 +1230,9 @@
     function registerSettings() {
         Lampa.SettingsApi.addComponent({
             component: PLUGIN_ID,
-            icon: icon,
-            name: 'Plex Watchlist'
+            icon: settingsIcon,
+            name: 'Plex Watchlist',
+            before: 'parser'
         });
 
         Lampa.SettingsApi.addParam({
@@ -1079,7 +1310,7 @@
                 name: 'plex_watchlist_open'
             },
             field: {
-                name: 'Открыть Watchlist'
+                name: 'Открыть ' + WATCHLIST_TITLE
             },
             onChange: function () {
                 Lampa.Controller.toContent();
@@ -1135,7 +1366,7 @@
                 default: false
             },
             field: {
-                name: 'Удалять фильмы из Watchlist',
+                name: 'Удалять фильмы из ' + WATCHLIST_TITLE,
                 description: 'Только для фильмов после отметки просмотренным'
             }
         });

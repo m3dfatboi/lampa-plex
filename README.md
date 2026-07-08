@@ -4,9 +4,11 @@
 
 ## Что умеет
 
-- Добавляет пункт `Plex Watchlist` в боковое меню Lampa.
+- Добавляет пункт `Буду смотреть` в боковое меню Lampa.
 - Показывает Watchlist из Plex отдельным нативным разделом Lampa.
-- Добавляет пункт `Добавить в Plex Watchlist` в меню действий карточки.
+- Добавляет `Добавить/Удалить из Буду смотреть` первым пунктом в меню действий карточки.
+- Заменяет кнопку избранного на full-странице на добавление/удаление из `Буду смотреть`.
+- Добавляет кнопку `Оценить на Plex`; после оценки тайтл отмечается просмотренным в Plex.
 - Авторизуется в Plex по коду через официальный PIN-flow, без ручного поиска токена.
 - Может отмечать фильмы и серии как просмотренные в Plex, когда прогресс Lampa достигает выбранного порога.
 
@@ -30,7 +32,7 @@
 
 - Синхронизируется watched/unwatched state, не точный тайминг остановки.
 - Маппинг Lampa -> Plex выполняется через Plex Discover search по названию, типу и году.
-- Для открытия карточек из Plex Watchlist в Lampa нужен TMDB id. Плагин пытается достать его из metadata `Guid`.
+- Для открытия карточек из `Буду смотреть` в Lampa нужен TMDB id. Плагин пытается достать его из metadata `Guid`.
 - Синхронизация серий зависит от того, как текущий Lampa-балансер формирует `timeline.hash`; в плагине есть несколько эвристик для популярных схем.
 
 ## Plex endpoints
@@ -41,5 +43,6 @@
 - `https://discover.provider.plex.tv/actions/addToWatchlist`
 - `https://discover.provider.plex.tv/actions/removeFromWatchlist`
 - `https://metadata.provider.plex.tv/actions/scrobble`
+- `https://metadata.provider.plex.tv/:/rate`
 - `https://metadata.provider.plex.tv/library/metadata/{ratingKey}/userState`
 - `https://plex.tv/api/v2/pins`
