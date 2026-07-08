@@ -2,7 +2,7 @@
     'use strict';
 
     var PLUGIN_ID = 'plex_watchlist';
-    var VERSION = '0.4.6';
+    var VERSION = '0.4.7';
     var WATCHLIST_TITLE = 'Очередь';
     var WATCHLIST_FROM_TITLE = 'Очереди';
     var PLEX = 'https://plex.tv';
@@ -2245,6 +2245,7 @@
 
             if (!card || !cardTitle(card) || !body.length || body.data('plex-watchlist-full')) return;
 
+            currentCard = card;
             body.data('plex-watchlist-full', true);
 
             var watchlistButton = replaceFavoriteButton(event, card, body);
@@ -2368,6 +2369,41 @@
                 delete pendingSync[hash];
             });
         });
+
+        if (Lampa.Listener && Lampa.Listener.follow) {
+            Lampa.Listener.follow('state:changed', function (event) {
+                syncManualTimelineEpisode(event);
+            });
+        }
+    }
+
+    function syncManualTimelineEpisode(event) {
+        if (!storageGet('plex_watchlist_sync_watched', true)) return;
+        if (!token() || !event || event.target != 'timeline' || event.reason != 'update') return;
+        if (!event.data || !event.data.road) return;
+
+        var hash = String(event.data.hash);
+        var road = event.data.road;
+        var threshold = parseInt(storageGet('plex_watchlist_sync_threshold', '90'), 10) || 90;
+
+        if ((road.percent || 0) < threshold) return;
+        if (pendingSync[hash]) return;
+
+        pendingSync[hash] = true;
+
+        inferTimelinePlayback(hash, function (playback) {
+            if (!playback || !playback.card || !playback.season || !playback.episode) {
+                delete pendingSync[hash];
+                return;
+            }
+
+            syncWatched(playback, function () {
+                console.log('Plex Watchlist', 'manual episode mark synced', cardTitle(playback.card), playback.season, playback.episode);
+                delete pendingSync[hash];
+            }, function () {
+                delete pendingSync[hash];
+            });
+        });
     }
 
     function rememberPlayback(data) {
@@ -2435,6 +2471,101 @@
         return null;
     }
 
+    function inferTimelinePlayback(hash, done) {
+        var playback = playbackByHash[hash] || inferCurrentPlayback(hash);
+        var card;
+        var info;
+
+        if (playback && playback.card) {
+            done(playback);
+            return;
+        }
+
+        card = activeSeriesCard();
+
+        if (!card) {
+            done(null);
+            return;
+        }
+
+        info = episodeByKnownHash(card, hash);
+
+        if (info) {
+            done({
+                hash: hash,
+                card: card,
+                title: '',
+                season: info.season,
+                episode: info.episode
+            });
+            return;
+        }
+
+        resolveEpisodeByHash(card, hash, function (resolved) {
+            done({
+                hash: hash,
+                card: card,
+                title: '',
+                season: resolved.season,
+                episode: resolved.episode
+            });
+        }, function () {
+            done(null);
+        });
+    }
+
+    function activeActivityObject() {
+        try {
+            return Lampa.Activity && Lampa.Activity.active ? Lampa.Activity.active() : null;
+        } catch (e) {}
+
+        return null;
+    }
+
+    function activeSeriesCard() {
+        var active = activeActivityObject();
+        var candidates = [];
+
+        if (active) {
+            candidates.push(active.card);
+            candidates.push(active.movie);
+            candidates.push(active.object && active.object.card);
+            candidates.push(active.object && active.object.movie);
+            candidates.push(active.data && active.data.card);
+            candidates.push(active.data && active.data.movie);
+        }
+
+        candidates.push(currentCard);
+
+        for (var i = 0; i < candidates.length; i++) {
+            var card = candidates[i];
+
+            if (card && cardTitle(card) && cardType(card) == 'show') return card;
+        }
+
+        return null;
+    }
+
+    function activeSeasonHint() {
+        var active = activeActivityObject();
+        var values = [];
+
+        if (active) {
+            values.push(active.season);
+            values.push(active.object && active.object.season);
+            values.push(active.data && active.data.season);
+            values.push(active.params && active.params.season);
+        }
+
+        for (var i = 0; i < values.length; i++) {
+            var season = parseInt(values[i], 10);
+
+            if (season > 0) return season;
+        }
+
+        return 0;
+    }
+
     function parseSeasonEpisode(title) {
         var text = (title || '').toString();
         var found = text.match(/S\s*(\d+)\s*[/xXeE: -]+(?:E\s*)?(\d+)/i) || text.match(/(\d+)\s*сезон.*?(\d+)\s*сер/i);
@@ -2463,22 +2594,107 @@
         return out.map(String);
     }
 
-    function resolveEpisodeByHash(card, hash, success) {
-        if (!Lampa.TimeTable || !Lampa.TimeTable.get) return;
+    function possibleSeasonNumbers(card) {
+        var hint = activeSeasonHint();
+        var max = parseInt(card && (card.number_of_seasons || card.seasons_count), 10) || 0;
+        var next = card && (card.next_episode_to_air || card.last_episode_to_air) || {};
+        var out = [];
+        var seen = {};
+        var limit;
+
+        if (next.season_number) max = Math.max(max, parseInt(next.season_number, 10) || 0);
+        if (!max) max = hint || 80;
+
+        limit = Math.min(Math.max(max, hint || 0, 1), 120);
+
+        function add(season) {
+            season = parseInt(season, 10);
+
+            if (season > 0 && !seen[season]) {
+                seen[season] = true;
+                out.push(season);
+            }
+        }
+
+        add(hint);
+
+        for (var i = 1; i <= limit; i++) add(i);
+
+        return out;
+    }
+
+    function possibleEpisodeLimit(card) {
+        var total = parseInt(card && card.number_of_episodes, 10) || 0;
+        var seasons = parseInt(card && card.number_of_seasons, 10) || 0;
+        var next = card && (card.next_episode_to_air || card.last_episode_to_air) || {};
+        var limit = 300;
+
+        if (seasons <= 1 && total) limit = total + 5;
+        else if (seasons > 1 && total) limit = Math.ceil(total / seasons) + 60;
+
+        if (next.episode_number) limit = Math.max(limit, parseInt(next.episode_number, 10) + 5 || 0);
+
+        return Math.min(Math.max(limit, 300), 2000);
+    }
+
+    function episodeByKnownHash(card, hash) {
+        var seasons;
+        var episodeLimit;
+
+        if (!card || !Lampa.Utils || !Lampa.Utils.hash) return null;
+
+        seasons = possibleSeasonNumbers(card);
+        episodeLimit = possibleEpisodeLimit(card);
+
+        for (var s = 0; s < seasons.length; s++) {
+            var season = seasons[s];
+
+            for (var episode = 1; episode <= episodeLimit; episode++) {
+                var variants = episodeHashVariants(card, season, episode);
+
+                if (variants.indexOf(String(hash)) >= 0) {
+                    return {
+                        season: season,
+                        episode: episode
+                    };
+                }
+            }
+        }
+
+        return null;
+    }
+
+    function resolveEpisodeByHash(card, hash, success, fail) {
+        var known = episodeByKnownHash(card, hash);
+
+        if (known) {
+            success(known);
+            return;
+        }
+
+        if (!Lampa.TimeTable || !Lampa.TimeTable.get) {
+            if (fail) fail();
+            return;
+        }
 
         Lampa.TimeTable.get(card, function (episodes) {
+            var resolved = false;
+
             asArray(episodes).forEach(function (ep) {
                 var season = ep.season_number || ep.season || 1;
                 var episode = ep.episode_number || ep.episode || ep.number;
                 var variants = episodeHashVariants(card, season, episode);
 
-                if (variants.indexOf(String(hash)) >= 0) {
+                if (!resolved && variants.indexOf(String(hash)) >= 0) {
+                    resolved = true;
                     success({
                         season: season,
                         episode: episode
                     });
                 }
             });
+
+            if (!resolved && fail) fail();
         });
     }
 
