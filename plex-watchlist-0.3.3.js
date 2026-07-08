@@ -3,7 +3,7 @@
 
     var script = document.createElement('script');
 
-    script.src = 'https://m3dfatboi.github.io/lampa-plex/plex-watchlist.js?v=0.3.3';
+    script.src = 'https://m3dfatboi.github.io/lampa-plex/plex-watchlist.js?v=0.3.4';
 
     (document.head || document.body || document.documentElement).appendChild(script);
 })();

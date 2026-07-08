@@ -2,7 +2,7 @@
     'use strict';
 
     var PLUGIN_ID = 'plex_watchlist';
-    var VERSION = '0.3.3';
+    var VERSION = '0.3.4';
     var WATCHLIST_TITLE = 'Очередь';
     var WATCHLIST_FROM_TITLE = 'Очереди';
     var PLEX = 'https://plex.tv';
@@ -41,6 +41,7 @@
         Lampa.Manifest.plugins = manifest;
 
         registerSettings();
+        registerStyles();
         registerRoute();
         registerMenu();
         registerContextAction();
@@ -404,6 +405,25 @@
             setCachedWatchlisted(ratingKey, false);
             if (success) success(data);
         }, fail);
+    }
+
+    function registerStyles() {
+        var styleId = PLUGIN_ID + '_styles';
+        var css = [
+            '.plex-watchlist-page .category-full .card{',
+            'margin-bottom:2.2em;',
+            '}'
+        ].join('');
+
+        if (document.getElementById(styleId)) return;
+
+        var style = document.createElement('style');
+
+        style.id = styleId;
+        style.type = 'text/css';
+        style.appendChild(document.createTextNode(css));
+
+        (document.head || document.documentElement).appendChild(style);
     }
 
     function markPlayed(ratingKey, success, fail) {
@@ -986,6 +1006,8 @@
 
     function PlexWatchlistComponent(object) {
         var comp = new Lampa.InteractionCategory(object);
+
+        comp.render().addClass('plex-watchlist-page');
 
         comp.create = function () {
             loadWatchlist(object.page || 1, this.build.bind(this), this.empty.bind(this));
