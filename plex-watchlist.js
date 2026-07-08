@@ -2,21 +2,26 @@
     'use strict';
 
     var PLUGIN_ID = 'plex_watchlist';
-    var VERSION = '0.3.5';
+    var VERSION = '0.4.0';
     var WATCHLIST_TITLE = 'Очередь';
     var WATCHLIST_FROM_TITLE = 'Очереди';
     var PLEX = 'https://plex.tv';
     var DISCOVER = 'https://discover.provider.plex.tv';
     var DISCOVER_IDENTIFIER = 'tv.plex.provider.discover';
     var METADATA = 'https://metadata.provider.plex.tv';
+    var COMMUNITY = 'https://community.plex.tv';
     var WATCHLIST_PATH = '/library/sections/watchlist/all';
     var CACHE_KEY = 'plex_watchlist_cache';
     var CACHE_SCHEMA = 2;
     var CLIENT_ID_KEY = 'plex_watchlist_client_id';
     var PAGE_SIZE = 20;
+    var PLEX_ROW_SIZE = 24;
     var LAMPA_CARD_CONCURRENCY = 4;
     var AUTH_POLL_INTERVAL = 3000;
     var AUTH_TIMEOUT = 15 * 60 * 1000;
+    var PROFILE_PARENT_FIELDS = 'fragment parentFields on MetadataItem { index title publishedAt key type images { coverArt coverPoster thumbnail art } userState @skip(if: $skipUserState) { viewCount viewedLeafCount watchlistedAt } }';
+    var PROFILE_ITEM_FIELDS = 'fragment itemFields on MetadataItem { id images { coverArt coverPoster thumbnail art } userState @skip(if: $skipUserState) { viewCount viewedLeafCount watchlistedAt } title key type index publicPagesURL parent { ...parentFields } grandparent { ...parentFields } publishedAt leafCount year originallyAvailableAt childCount }';
+    var PROFILE_WATCH_HISTORY_QUERY = 'query GetWatchHistoryHub($uuid: ID = "", $first: PaginationInt!, $after: String, $skipUserState: Boolean = false) { user(id: $uuid) { watchHistory(first: $first, after: $after) { nodes { metadataItem { ...itemFields } date id } pageInfo { hasNextPage hasPreviousPage endCursor } } } } ' + PROFILE_ITEM_FIELDS + ' ' + PROFILE_PARENT_FIELDS;
 
     var manifest = {
         type: 'other',
@@ -33,6 +38,9 @@
     var playbackByHash = {};
     var pendingSync = {};
     var currentCard = null;
+    var plexRowsRegistered = false;
+    var plexMarkerScanTimer = null;
+    var plexMarkerInterval = null;
 
     function startPlugin() {
         if (window.plex_watchlist_ready) return;
@@ -47,6 +55,8 @@
         registerContextAction();
         registerFullButtons();
         registerPlaybackSync();
+        registerPlexRows();
+        registerPlexMarkers();
 
         console.log('Plex Watchlist', 'started', VERSION);
     }
@@ -108,6 +118,7 @@
         cache.watchlist_checked = cache.watchlist_checked || {};
         cache.lampa = cache.lampa || {};
         cache.episodes = cache.episodes || {};
+        cache.watched = cache.watched || {};
 
         return cache;
     }
@@ -167,6 +178,24 @@
         xhr.send(options.body ? JSON.stringify(options.body) : null);
     }
 
+    function graphQL(document, variables, success, fail) {
+        request('POST', COMMUNITY + '/api', {}, function (data) {
+            if (data && data.errors && data.errors.length) {
+                console.log('Plex Watchlist', 'graphql error', data.errors);
+                if (fail) fail(data);
+                return;
+            }
+
+            success(data && data.data ? data.data : data);
+        }, fail, {
+            contentType: 'application/json',
+            body: {
+                query: document,
+                variables: variables || {}
+            }
+        });
+    }
+
     function asArray(value) {
         if (!value) return [];
         return Array.isArray(value) ? value : [value];
@@ -195,6 +224,129 @@
         });
 
         return out;
+    }
+
+    function collectHubItems(hub) {
+        var out = [];
+
+        if (!hub) return out;
+
+        ['Metadata', 'Video', 'Directory'].forEach(function (name) {
+            asArray(hub[name]).forEach(function (item) {
+                out.push(item);
+            });
+        });
+
+        return out;
+    }
+
+    function normalizePlexType(type) {
+        var value = (type || '').toString().toLowerCase();
+
+        if (value == 'movie') return 'movie';
+        if (value == 'episode') return 'episode';
+        if (value == 'season') return 'season';
+        if (value == 'show' || value == 'series' || value == 'tv') return 'show';
+
+        return value;
+    }
+
+    function metadataRatingKey(item) {
+        if (!item) return '';
+
+        var key = item.ratingKey || item.id || '';
+        var path = item.key || item.sourceURI || item.publicPagesURL || '';
+        var found = (path + '').match(/metadata\/([^/?#]+)/);
+
+        return found ? found[1] : key;
+    }
+
+    function graphImage(images, preferred) {
+        images = images || {};
+
+        return images[preferred || 'coverPoster'] || images.coverPoster || images.coverArt || images.thumbnail || images.art || '';
+    }
+
+    function stateWatched(state, item) {
+        if (!state) return false;
+
+        var viewed = parseInt(state.viewCount || 0, 10) > 0;
+        var viewedLeafCount = parseInt(state.viewedLeafCount || 0, 10) || 0;
+        var leafCount = parseInt(item && item.leafCount || 0, 10) || 0;
+
+        return viewed || (leafCount > 0 && viewedLeafCount >= leafCount);
+    }
+
+    function metadataWatched(item) {
+        if (!item) return false;
+
+        var state = item.UserState || item.userState || {};
+        if (Array.isArray(state)) state = state[0] || {};
+
+        return !!(item.viewCount || item.lastViewedAt || item.viewedAt || stateWatched(state, item));
+    }
+
+    function metadataWatchlisted(item) {
+        if (!item) return false;
+
+        var state = item.UserState || item.userState || {};
+        if (Array.isArray(state)) state = state[0] || {};
+
+        return isUserStateWatchlisted(state) || !!item.watchlistedAt;
+    }
+
+    function episodeLabel(season, episode) {
+        if (!season && !episode) return '';
+        if (season && episode) return 'S' + season + ' E' + episode;
+        if (episode) return 'E' + episode;
+        return 'S' + season;
+    }
+
+    function attachEpisodeFields(card, item) {
+        var season = item.plex_episode_season || item.parentIndex || item.season || item.seasonNumber || (item.parent && item.parent.index) || '';
+        var episode = item.plex_episode_number || item.index || item.episode || item.episodeNumber || '';
+
+        if (season) card.plex_episode_season = parseInt(season, 10) || season;
+        if (episode) card.plex_episode_number = parseInt(episode, 10) || episode;
+        if (card.plex_episode_season || card.plex_episode_number) card.plex_episode_label = episodeLabel(card.plex_episode_season, card.plex_episode_number);
+
+        if (item.ratingKey || item.id || item.key) card.plex_episode_rating_key = metadataRatingKey(item);
+    }
+
+    function graphMetadataToPlexItem(meta, entry) {
+        if (!meta) return null;
+
+        var type = normalizePlexType(meta.type);
+        var isEpisode = type == 'episode';
+        var show = isEpisode && meta.grandparent ? meta.grandparent : meta;
+        var parent = isEpisode ? meta.parent || {} : {};
+        var images = show.images || meta.images || {};
+        var item = {
+            ratingKey: isEpisode ? metadataRatingKey(meta) : metadataRatingKey(show),
+            guid: show.guid || meta.guid || '',
+            type: isEpisode ? 'episode' : (type == 'season' ? 'show' : type),
+            title: isEpisode ? show.title || meta.title : meta.title,
+            year: show.year || meta.year || '',
+            originallyAvailableAt: show.originallyAvailableAt || show.publishedAt || meta.originallyAvailableAt || meta.publishedAt || '',
+            thumb: graphImage(images, 'coverPoster') || graphImage(meta.images, 'coverPoster'),
+            art: graphImage(images, 'art') || graphImage(meta.images, 'art'),
+            key: isEpisode ? meta.key || show.key : show.key || meta.key || '',
+            UserState: isEpisode ? meta.userState || show.userState || {} : show.userState || meta.userState || {}
+        };
+
+        if (isEpisode) {
+            item.grandparentTitle = show.title || meta.grandparentTitle || '';
+            item.grandparentRatingKey = metadataRatingKey(show);
+            item.grandparentThumb = graphImage(show.images, 'coverPoster');
+            item.grandparentArt = graphImage(show.images, 'art');
+            item.parentTitle = parent.title || '';
+            item.parentIndex = parent.index || meta.parentIndex || '';
+            item.index = meta.index || '';
+        }
+
+        if (entry && entry.date) item.viewedAt = entry.date;
+
+        return item;
     }
 
     function cardType(card) {
@@ -359,10 +511,21 @@
 
         if (direct && direct.ratingKey) {
             if (isCachedWatchlistRemoved(direct.ratingKey)) return false;
-            return isCachedWatchlisted(direct.ratingKey) || String(card.id || '').indexOf('plex_') === 0;
+            return !!card.plex_watchlisted || isCachedWatchlisted(direct.ratingKey);
         }
 
         return !!(cached && cached.ratingKey && isCachedWatchlisted(cached.ratingKey));
+    }
+
+    function isCardWatched(card) {
+        var cache = getCache();
+        var direct = plexItemFromCard(card);
+        var cached = cache.items[cardKey(card)];
+
+        if (card && card.plex_watched) return true;
+        if (direct && direct.ratingKey && cache.watched[direct.ratingKey]) return true;
+
+        return !!(cached && cached.ratingKey && cache.watched[cached.ratingKey]);
     }
 
     function setCachedWatchlisted(ratingKey, status) {
@@ -379,6 +542,19 @@
         }
 
         saveCache(cache);
+        schedulePlexMarkerScan();
+    }
+
+    function setCachedWatched(ratingKey, status) {
+        if (!ratingKey) return;
+
+        var cache = getCache();
+
+        if (status) cache.watched[ratingKey] = Date.now();
+        else delete cache.watched[ratingKey];
+
+        saveCache(cache);
+        schedulePlexMarkerScan();
     }
 
     function isUserStateWatchlisted(state) {
@@ -412,6 +588,23 @@
         var css = [
             '.plex-watchlist-page .category-full .card{',
             'margin-bottom:1em;',
+            '}',
+            '.card__plex-episode{',
+            'position:absolute;',
+            'left:.45em;',
+            'bottom:.45em;',
+            'min-width:2.2em;',
+            'box-sizing:border-box;',
+            'padding:.2em .55em;',
+            'border-radius:1em;',
+            'background:rgba(0,0,0,.62);',
+            'color:#fff;',
+            'font-size:.95em;',
+            'font-weight:700;',
+            'line-height:1.25;',
+            'text-align:center;',
+            'z-index:2;',
+            'white-space:nowrap;',
             '}'
         ].join('');
 
@@ -430,7 +623,10 @@
         request('PUT', DISCOVER + '/actions/scrobble', {
             key: ratingKey,
             identifier: DISCOVER_IDENTIFIER
-        }, success || function () {}, fail);
+        }, function (data) {
+            setCachedWatched(ratingKey, true);
+            if (success) success(data);
+        }, fail);
     }
 
     function ratePlexItem(ratingKey, rating, success, fail) {
@@ -439,6 +635,382 @@
             identifier: DISCOVER_IDENTIFIER,
             rating: rating
         }, success || function () {}, fail);
+    }
+
+    function disableNativeRows() {
+        try {
+            Lampa.Storage.set('content_rows_continue_watch', 'false', true);
+            Lampa.Storage.set('content_rows_timetable_lately', 'false', true);
+            Lampa.Storage.set('content_rows_timetable_recently', 'false', true);
+        } catch (e) {
+            console.log('Plex Watchlist', 'native rows disable failed', e);
+        }
+    }
+
+    function registerPlexRows() {
+        if (plexRowsRegistered || !Lampa.ContentRows || !Lampa.ContentRows.add) return;
+
+        plexRowsRegistered = true;
+        disableNativeRows();
+
+        Lampa.ContentRows.add({
+            name: 'plex_continue_watch',
+            title: 'Продолжить просмотр',
+            index: 1,
+            screen: ['main', 'category'],
+            call: function (params, screen) {
+                if (!token()) return;
+                if (screen == 'category' && params.url == 'movie') return;
+                if (screen == 'category' && params.url && params.url != 'tv' && params.url != 'anime') return;
+
+                return function (call) {
+                    loadPlexContinueWatching(function (cards) {
+                        call(makePlexRow('Продолжить просмотр', cards));
+                    }, function () {
+                        call();
+                    });
+                };
+            }
+        });
+
+        Lampa.ContentRows.add({
+            name: 'plex_recent_episodes',
+            title: 'Новые эпизоды',
+            index: 2,
+            screen: ['main', 'category'],
+            call: function (params, screen) {
+                if (!token()) return;
+                if (screen == 'category' && params.url == 'movie') return;
+                if (screen == 'category' && params.url && params.url != 'tv' && params.url != 'anime') return;
+
+                return function (call) {
+                    loadPlexRecentlyAired(function (cards) {
+                        call(makePlexRow('Новые эпизоды', cards));
+                    }, function () {
+                        call();
+                    });
+                };
+            }
+        });
+
+        Lampa.ContentRows.add({
+            name: 'plex_movie_history',
+            title: 'Вы смотрели',
+            index: 1,
+            screen: ['category'],
+            call: function (params) {
+                if (!token() || params.url != 'movie') return;
+
+                return function (call) {
+                    loadPlexMovieHistory(function (cards) {
+                        call(makePlexRow('Вы смотрели', cards));
+                    }, function () {
+                        call();
+                    });
+                };
+            }
+        });
+    }
+
+    function makePlexRow(title, cards) {
+        if (!cards || !cards.length) return;
+
+        return {
+            title: title,
+            results: cards
+        };
+    }
+
+    function hubRequestParams() {
+        return {
+            includeCollections: 1,
+            includeExternalMedia: 1,
+            includeGuids: 1,
+            includeMetadata: 1,
+            includeUserState: 1,
+            count: PLEX_ROW_SIZE,
+            'X-Plex-Container-Start': 0,
+            'X-Plex-Container-Size': PLEX_ROW_SIZE
+        };
+    }
+
+    function hubText(hub) {
+        return normalizeTitle([
+            hub && hub.title,
+            hub && hub.context,
+            hub && hub.key,
+            hub && hub.hubIdentifier,
+            hub && hub.sourceURI,
+            hub && hub.type
+        ].join(' '));
+    }
+
+    function pickHub(data, names) {
+        var hubs = asArray(mediaContainer(data).Hub);
+        var picked = null;
+
+        hubs.forEach(function (hub) {
+            var text = hubText(hub);
+            var compactText = text.replace(/\s+/g, '');
+
+            if (picked) return;
+
+            names.forEach(function (name) {
+                var normalized = normalizeTitle(name);
+                var compact = normalized.replace(/\s+/g, '');
+
+                if (!picked && (text.indexOf(normalized) >= 0 || compactText.indexOf(compact) >= 0)) picked = hub;
+            });
+        });
+
+        return picked;
+    }
+
+    function loadHubItems(names, success, fail) {
+        var paths = [
+            '/hubs/sections/watchlist/recommended',
+            '/hubs/sections/watchlist',
+            '/hubs/sections/home',
+            '/hubs'
+        ];
+        var index = 0;
+
+        function next() {
+            if (index >= paths.length) {
+                if (fail) fail();
+                return;
+            }
+
+            request('GET', DISCOVER + paths[index++], hubRequestParams(), function (data) {
+                var hub = pickHub(data, names);
+                var items = collectHubItems(hub);
+
+                if (items.length) success(items);
+                else next();
+            }, next);
+        }
+
+        next();
+    }
+
+    function loadPlexContinueWatching(success, fail) {
+        loadHubItems(['continue watching', 'continueWatching', 'continue'], function (items) {
+            hydratePlexItems(items, 'continue', success);
+        }, fail);
+    }
+
+    function loadPlexRecentlyAired(success, fail) {
+        loadHubItems(['recently aired', 'recentlyAiredEpisodes', 'recent episodes', 'new episodes', 'recently released'], function (items) {
+            hydratePlexItems(items, 'recent_episodes', success);
+        }, fail);
+    }
+
+    function loadProfileWatchHistory(success, fail) {
+        graphQL(PROFILE_WATCH_HISTORY_QUERY, {
+            uuid: '',
+            first: PLEX_ROW_SIZE * 2,
+            skipUserState: false
+        }, function (data) {
+            var history = data && data.user && data.user.watchHistory ? data.user.watchHistory : {};
+            var nodes = asArray(history.nodes);
+            var items = [];
+
+            nodes.forEach(function (node) {
+                var item = graphMetadataToPlexItem(node.metadataItem, node);
+                if (item) items.push(item);
+            });
+
+            if (items.length) success(items);
+            else if (fail) fail();
+        }, fail);
+    }
+
+    function loadPlexMovieHistory(success, fail) {
+        loadProfileWatchHistory(function (items) {
+            var movies = items.filter(function (item) {
+                return normalizePlexType(item.type) == 'movie';
+            }).slice(0, PLEX_ROW_SIZE);
+
+            if (!movies.length) {
+                loadPlexMovieHistoryFallback(success, fail);
+                return;
+            }
+
+            hydratePlexItems(movies, 'history', success, {
+                watched: true
+            });
+        }, function () {
+            loadPlexMovieHistoryFallback(success, fail);
+        });
+    }
+
+    function loadPlexMovieHistoryFallback(success, fail) {
+        loadHubItems(['watch history', 'recently watched', 'watch again', 'history'], function (items) {
+            var movies = items.filter(function (item) {
+                return normalizePlexType(item.type) == 'movie';
+            }).slice(0, PLEX_ROW_SIZE);
+
+            if (!movies.length) {
+                if (fail) fail();
+                return;
+            }
+
+            hydratePlexItems(movies, 'history', success, {
+                watched: true
+            });
+        }, fail);
+    }
+
+    function hydratePlexItems(items, rowKind, success, options) {
+        options = options || {};
+
+        var cards = [];
+
+        items.forEach(function (item) {
+            var card = plexToLampaCard(item);
+
+            if (!card || !cardTitle(card)) return;
+
+            card.plex_row_kind = rowKind;
+            card.plex_watched = options.watched || metadataWatched(item);
+            card.plex_watchlisted = metadataWatchlisted(item);
+            applyPlexCardDecorations(card);
+            cards.push(card);
+        });
+
+        if (!cards.length) {
+            success([]);
+            return;
+        }
+
+        rememberPlexCards(cards);
+
+        hydrateLampaCards(cards, function (hydrated) {
+            hydrated.forEach(function (card) {
+                applyPlexCardDecorations(card);
+            });
+
+            rememberPlexCards(hydrated);
+            success(hydrated);
+        });
+    }
+
+    function rememberPlexCards(cards) {
+        var cache = getCache();
+
+        cards.forEach(function (card) {
+            var direct = plexItemFromCard(card);
+
+            if (!direct || !direct.ratingKey) return;
+
+            cache.items[cardKey(card)] = direct;
+
+            if (card.plex_watched) cache.watched[direct.ratingKey] = Date.now();
+            if (card.plex_watchlisted) {
+                cache.watchlist[direct.ratingKey] = Date.now();
+                cache.watchlist_checked[direct.ratingKey] = Date.now();
+                delete cache.watchlist_removed[direct.ratingKey];
+            }
+        });
+
+        saveCache(cache);
+        schedulePlexMarkerScan();
+    }
+
+    function applyPlexCardDecorations(card) {
+        card.params = card.params || {};
+
+        var existing = card.params.emit || {};
+        if (existing.plexWatchlistDecorated) return card;
+
+        var oldCreate = existing.onCreate;
+        var emit = {};
+
+        for (var key in existing) {
+            if (existing.hasOwnProperty(key)) emit[key] = existing[key];
+        }
+
+        emit.onCreate = function () {
+            if (typeof oldCreate == 'function') oldCreate.apply(this, arguments);
+            decorateCreatedCard(this.html, this.data || card);
+        };
+        emit.plexWatchlistDecorated = true;
+
+        card.params.emit = emit;
+
+        return card;
+    }
+
+    function domElement(node) {
+        if (!node) return null;
+        if (node.nodeType) return node;
+        if (node[0] && node[0].nodeType) return node[0];
+        return null;
+    }
+
+    function decorateCreatedCard(root, card) {
+        var element = domElement(root);
+
+        if (!element || !card) return;
+
+        if (isCardWatchlisted(card) || card.plex_watchlisted) addCardIcon(element, 'wath');
+        if (isCardWatched(card) || card.plex_watched) addCardIcon(element, 'history');
+        if (card.plex_episode_label) addEpisodeBadge(element, card.plex_episode_label);
+    }
+
+    function addCardIcon(element, name) {
+        var inner = element.querySelector('.card__icons-inner');
+
+        if (!inner) return;
+        if (inner.querySelector('.icon--' + name)) return;
+
+        var icon = document.createElement('div');
+
+        icon.className = 'card__icon icon--' + name + ' plex-watchlist-icon plex-watchlist-icon--' + name;
+        inner.appendChild(icon);
+    }
+
+    function addEpisodeBadge(element, label) {
+        var view = element.querySelector('.card__view');
+        var badge = element.querySelector('.card__plex-episode');
+
+        if (!view || !label) return;
+
+        if (!badge) {
+            badge = document.createElement('div');
+            badge.className = 'card__plex-episode';
+            view.appendChild(badge);
+        }
+
+        badge.textContent = label;
+    }
+
+    function scanPlexMarkers() {
+        var nodes = document.querySelectorAll('.card');
+
+        Array.prototype.forEach.call(nodes, function (node) {
+            if (node.card_data) decorateCreatedCard(node, node.card_data);
+        });
+    }
+
+    function schedulePlexMarkerScan() {
+        clearTimeout(plexMarkerScanTimer);
+
+        plexMarkerScanTimer = setTimeout(scanPlexMarkers, 350);
+    }
+
+    function registerPlexMarkers() {
+        if (Lampa.Listener && Lampa.Listener.follow) {
+            Lampa.Listener.follow('activity', function (event) {
+                if (event && (event.type == 'create' || event.type == 'start')) schedulePlexMarkerScan();
+            });
+
+            Lampa.Listener.follow('state:changed', function () {
+                schedulePlexMarkerScan();
+            });
+        }
+
+        if (!plexMarkerInterval) plexMarkerInterval = setInterval(scanPlexMarkers, 3000);
     }
 
     function toggleCardWatchlist(card, doneCallback, options) {
@@ -1043,10 +1615,18 @@
         }, function (data) {
             var box = mediaContainer(data);
             var plexItems = collectMetadata(data);
-            var items = plexItems.map(plexToLampaCard);
+            var items = plexItems.map(function (item) {
+                var card = plexToLampaCard(item);
+
+                card.plex_watchlisted = true;
+                applyPlexCardDecorations(card);
+
+                return card;
+            });
             var total = parseInt(box.totalSize || box.size || items.length, 10) || items.length;
 
             rememberWatchlist(items);
+            rememberPlexCards(items);
 
             if (!items.length) {
                 if (fail) fail();
@@ -1054,6 +1634,13 @@
             }
 
             hydrateLampaCards(items, function (cards) {
+                cards.forEach(function (card) {
+                    card.plex_watchlisted = true;
+                    applyPlexCardDecorations(card);
+                });
+                rememberWatchlist(cards);
+                rememberPlexCards(cards);
+
                 success({
                     results: cards,
                     page: page,
@@ -1079,11 +1666,19 @@
 
     function attachPlexFields(target, source) {
         target.plex_rating_key = source.plex_rating_key;
+        target.plex_episode_rating_key = source.plex_episode_rating_key || '';
+        target.plex_episode_season = source.plex_episode_season || '';
+        target.plex_episode_number = source.plex_episode_number || '';
+        target.plex_episode_label = source.plex_episode_label || '';
+        target.plex_row_kind = source.plex_row_kind || '';
+        target.plex_watched = !!source.plex_watched;
+        target.plex_watchlisted = !!source.plex_watchlisted;
         target.plex_guid = source.plex_guid || '';
         target.plex_art = source.plex_art || '';
         target.plex_title = source.plex_title || source.title || source.name || '';
         target.plex_tmdb_id = source.tmdb_id || (typeof source.id == 'number' ? source.id : '');
         target.source = target.source || 'tmdb';
+        applyPlexCardDecorations(target);
 
         return target;
     }
@@ -1366,31 +1961,43 @@
     }
 
     function plexToLampaCard(item) {
-        var isShow = item.type == 'show';
-        var year = item.year || ((item.originallyAvailableAt || '').match(/\d{4}/) || [''])[0];
+        var type = normalizePlexType(item.type);
+        var isEpisode = type == 'episode';
+        var isShow = type == 'show' || type == 'season' || isEpisode;
+        var title = isEpisode ? item.grandparentTitle || item.parentTitle || item.title : item.title;
+        var ratingKey = isEpisode ? item.grandparentRatingKey || item.parentRatingKey || item.ratingKey : item.ratingKey;
+        var guid = isEpisode ? item.grandparentGuid || item.parentGuid || item.guid : item.guid;
+        var year = item.grandparentYear || item.year || ((item.originallyAvailableAt || '').match(/\d{4}/) || [''])[0];
+        var thumb = isEpisode ? item.grandparentThumb || item.parentThumb || item.thumb : item.thumb;
+        var art = isEpisode ? item.grandparentArt || item.parentArt || item.art : item.art;
         var card = {
-            id: 'plex_' + item.ratingKey,
-            title: item.title,
-            original_title: item.title,
+            id: 'plex_' + (ratingKey || item.ratingKey || item.id || Date.now()),
+            title: title,
+            original_title: title,
             release_date: item.originallyAvailableAt || (year ? year + '-01-01' : ''),
-            poster: item.thumb,
-            img: item.thumb,
-            background_image: item.art || '',
-            plex_art: item.art,
-            plex_guid: item.guid,
-            plex_rating_key: item.ratingKey,
-            plex_title: item.title,
+            poster: thumb,
+            img: thumb,
+            background_image: art || '',
+            plex_art: art,
+            plex_guid: guid,
+            plex_rating_key: ratingKey || item.ratingKey,
+            plex_title: title,
             source: 'tmdb',
-            year: year
+            year: year,
+            plex_watched: metadataWatched(item),
+            plex_watchlisted: metadataWatchlisted(item)
         };
 
         if (isShow) {
-            card.name = item.title;
-            card.original_name = item.title;
+            card.name = title;
+            card.original_name = title;
             card.first_air_date = item.originallyAvailableAt || card.release_date;
         }
 
+        if (isEpisode) attachEpisodeFields(card, item);
+
         attachTmdbIdFromGuids(card, item);
+        applyPlexCardDecorations(card);
 
         return card;
     }
@@ -1403,6 +2010,9 @@
         });
 
         if (item.guid) guids.push(item.guid);
+        if (item.parentGuid) guids.push(item.parentGuid);
+        if (item.grandparentGuid) guids.push(item.grandparentGuid);
+        if (item.primaryGuid) guids.push(item.primaryGuid);
 
         guids.forEach(function (guid) {
             var tmdb = (guid + '').match(/tmdb:\/\/(\d+)/);

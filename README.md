@@ -9,6 +9,8 @@
 - Добавляет `Добавить в Очередь` / `Удалить из Очереди` первым пунктом в меню действий карточки.
 - Заменяет кнопку избранного на full-странице на добавление/удаление из `Очередь`.
 - Добавляет кнопку `Оценить на Plex`; после оценки тайтл отмечается просмотренным в Plex.
+- Подменяет нативные ряды истории Lampa на Plex: `Продолжить просмотр`, `Новые эпизоды`, `Вы смотрели`.
+- Показывает родные иконки Lampa для просмотренного из Plex и тайтлов из `Очередь`.
 - Авторизуется в Plex по коду через официальный PIN-flow, без ручного поиска токена.
 - Может отмечать фильмы и серии как просмотренные в Plex, когда прогресс Lampa достигает выбранного порога.
 
@@ -27,7 +29,7 @@
 Финальный файл плагина для Lampa:
 
 - `https://m3dfatboi.github.io/lampa-plex/plex-watchlist.js`
-- Если Lampa держит старый кэш: `https://m3dfatboi.github.io/lampa-plex/plex-watchlist-0.3.5.js`
+- Если Lampa держит старый кэш: `https://m3dfatboi.github.io/lampa-plex/plex-watchlist-0.4.0.js`
 
 ## Ограничения MVP
 
@@ -46,4 +48,5 @@
 - `https://discover.provider.plex.tv/actions/scrobble`
 - `https://discover.provider.plex.tv/actions/rate`
 - `https://metadata.provider.plex.tv/library/metadata/{ratingKey}/userState`
+- `https://community.plex.tv/api`
 - `https://plex.tv/api/v2/pins`
