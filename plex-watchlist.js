@@ -2,7 +2,7 @@
     'use strict';
 
     var PLUGIN_ID = 'plex_watchlist';
-    var VERSION = '0.4.3';
+    var VERSION = '0.4.4';
     var WATCHLIST_TITLE = 'Очередь';
     var WATCHLIST_FROM_TITLE = 'Очереди';
     var PLEX = 'https://plex.tv';
@@ -12,7 +12,7 @@
     var COMMUNITY = 'https://community.plex.tv';
     var WATCHLIST_PATH = '/library/sections/watchlist/all';
     var CACHE_KEY = 'plex_watchlist_cache';
-    var CACHE_SCHEMA = 4;
+    var CACHE_SCHEMA = 5;
     var CLIENT_ID_KEY = 'plex_watchlist_client_id';
     var PAGE_SIZE = 20;
     var PLEX_ROW_SIZE = 24;
@@ -381,10 +381,38 @@
         return (str || '').toString().toLowerCase().replace(/ё/g, 'е').replace(/[^a-zа-я0-9]+/g, ' ').trim();
     }
 
+    function normalizedTitleList(list) {
+        var out = [];
+        var seen = {};
+
+        list.forEach(function (title) {
+            var normalized = normalizeTitle(title);
+
+            if (normalized && !seen[normalized]) {
+                seen[normalized] = true;
+                out.push(normalized);
+            }
+        });
+
+        return out;
+    }
+
     function releaseYear(card) {
         var raw = card.release_date || card.first_air_date || card.originallyAvailableAt || card.year || '';
         var year = (raw + '').match(/\d{4}/);
         return year ? parseInt(year[0], 10) : 0;
+    }
+
+    function yearFromText(value) {
+        var year = (value || '').toString().match(/(?:^|[^0-9])((?:19|20)\d{2})(?:[^0-9]|$)/);
+
+        return year ? year[1] : '';
+    }
+
+    function metadataYear(item) {
+        item = item || {};
+
+        return item.year || yearFromText(item.originallyAvailableAt) || yearFromText(item.publishedAt) || yearFromText(item.publicPagesURL) || yearFromText(item.slug) || yearFromText(item.key) || yearFromText(item.sourceURI) || '';
     }
 
     function cardTitle(card) {
@@ -1170,9 +1198,11 @@
             'grandparentTitle',
             'grandparentRatingKey',
             'grandparentGuid',
+            'grandparentGuidList',
             'grandparentThumb',
             'grandparentArt',
             'grandparentYear',
+            'grandparentOriginallyAvailableAt',
             'parentTitle',
             'parentRatingKey',
             'parentGuid',
@@ -1203,6 +1233,54 @@
         return merged;
     }
 
+    function metadataGuidList(item) {
+        var guids = [];
+
+        item = item || {};
+
+        asArray(item.Guid).forEach(function (guid) {
+            if (guid && guid.id) guids.push(guid.id);
+        });
+
+        if (item.guid) guids.push(item.guid);
+
+        return guids;
+    }
+
+    function preferredGuid(item) {
+        var guids = metadataGuidList(item);
+        var best = '';
+
+        guids.forEach(function (guid) {
+            if (!best) best = guid;
+            if ((guid + '').indexOf('tmdb://') === 0) best = guid;
+        });
+
+        return best;
+    }
+
+    function mergeEpisodeShowDetail(item, show) {
+        var merged = {};
+        var showYear = metadataYear(show);
+        var showGuid = preferredGuid(show);
+        var showGuids = metadataGuidList(show);
+
+        for (var key in item) {
+            if (item.hasOwnProperty(key)) merged[key] = item[key];
+        }
+
+        if (show && show.title) merged.grandparentTitle = show.title;
+        if (show && metadataRatingKey(show)) merged.grandparentRatingKey = metadataRatingKey(show);
+        if (showGuid) merged.grandparentGuid = showGuid;
+        if (showGuids.length) merged.grandparentGuidList = showGuids;
+        if (showYear) merged.grandparentYear = showYear;
+        if (show && show.thumb) merged.grandparentThumb = show.thumb;
+        if (show && show.art) merged.grandparentArt = show.art;
+        if (show && show.originallyAvailableAt) merged.grandparentOriginallyAvailableAt = show.originallyAvailableAt;
+
+        return merged;
+    }
+
     function enrichEpisodeItem(item, done) {
         var ratingKey = metadataRatingKey(item);
 
@@ -1216,8 +1294,24 @@
             includeUserState: 1
         }, function (data) {
             var detail = collectMetadata(data)[0];
+            var merged = detail ? mergeEpisodeDetail(item, detail) : item;
+            var showKey = merged.grandparentRatingKey;
 
-            done(detail ? mergeEpisodeDetail(item, detail) : item);
+            if (!showKey || showKey == ratingKey) {
+                done(merged);
+                return;
+            }
+
+            request('GET', METADATA + '/library/metadata/' + encodeURIComponent(showKey), {
+                includeGuids: 1,
+                includeUserState: 1
+            }, function (showData) {
+                var show = collectMetadata(showData)[0];
+
+                done(show ? mergeEpisodeShowDetail(merged, show) : merged);
+            }, function () {
+                done(merged);
+            });
         }, function () {
             done(item);
         });
@@ -2351,24 +2445,25 @@
     function pickBestLampaMatch(sourceCard, results) {
         var wantedType = cardType(sourceCard) == 'show' ? 'tv' : 'movie';
         var wantedYear = releaseYear(sourceCard);
-        var wantedTitles = [
-            normalizeTitle(cardTitle(sourceCard)),
-            normalizeTitle(sourceCard.plex_title),
-            normalizeTitle(sourceCard.original_title),
-            normalizeTitle(sourceCard.original_name)
-        ];
+        var strictEpisode = !!sourceCard.plex_episode_label && !wantedYear && typeof sourceCard.id != 'number';
+        var wantedTitles = normalizedTitleList([
+            cardTitle(sourceCard),
+            sourceCard.plex_title,
+            sourceCard.original_title,
+            sourceCard.original_name
+        ]);
         var best = null;
         var bestScore = -1;
 
         results.forEach(function (item) {
             var itemType = item.plex_lampa_type || (item.name || item.original_name ? 'tv' : 'movie');
             var itemYear = releaseYear(item);
-            var titles = [
-                normalizeTitle(item.title),
-                normalizeTitle(item.name),
-                normalizeTitle(item.original_title),
-                normalizeTitle(item.original_name)
-            ];
+            var titles = normalizedTitleList([
+                item.title,
+                item.name,
+                item.original_title,
+                item.original_name
+            ]);
             var score = 0;
 
             if (itemType && itemType != wantedType) return;
@@ -2401,7 +2496,7 @@
             }
         });
 
-        return bestScore >= 30 ? best : null;
+        return bestScore >= (strictEpisode ? 80 : 30) ? best : null;
     }
 
     function rememberLampaMatch(sourceCard, lampaCard) {
@@ -2494,7 +2589,7 @@
         var title = isEpisode ? showTitle || item.title : item.title;
         var ratingKey = isEpisode ? item.grandparentRatingKey || item.parentRatingKey || item.ratingKey : item.ratingKey;
         var guid = isEpisode ? item.grandparentGuid || item.showGuid || '' : item.guid;
-        var year = isEpisode ? item.grandparentYear || item.parentYear || item.year || ((item.originallyAvailableAt || '').match(/\d{4}/) || [''])[0] : item.grandparentYear || item.year || ((item.originallyAvailableAt || '').match(/\d{4}/) || [''])[0];
+        var year = isEpisode ? item.grandparentYear || item.parentYear || metadataYear(item) : item.grandparentYear || metadataYear(item);
         var episodeYear = isEpisode ? ((episodeAirDate(item) || '').match(/\d{4}/) || [''])[0] : '';
         var thumb = isEpisode ? item.grandparentThumb || item.parentThumb || item.thumb : item.thumb;
         var art = isEpisode ? item.grandparentArt || item.parentArt || item.art : item.art;
@@ -2542,12 +2637,14 @@
         if (episodeCard && !card.plex_guid) return;
 
         if (!episodeCard) {
-            asArray(item.Guid).forEach(function (guid) {
-                if (guid && guid.id) guids.push(guid.id);
+            metadataGuidList(item).forEach(function (guid) {
+                guids.push(guid);
             });
-
-            if (item.guid) guids.push(item.guid);
             if (item.parentGuid) guids.push(item.parentGuid);
+        } else {
+            asArray(item.grandparentGuidList).forEach(function (guid) {
+                guids.push(guid);
+            });
         }
 
         if (item.grandparentGuid) guids.push(item.grandparentGuid);
