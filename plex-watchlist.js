@@ -2,7 +2,7 @@
     'use strict';
 
     var PLUGIN_ID = 'plex_watchlist';
-    var VERSION = '0.4.2';
+    var VERSION = '0.4.3';
     var WATCHLIST_TITLE = 'Очередь';
     var WATCHLIST_FROM_TITLE = 'Очереди';
     var PLEX = 'https://plex.tv';
@@ -12,7 +12,7 @@
     var COMMUNITY = 'https://community.plex.tv';
     var WATCHLIST_PATH = '/library/sections/watchlist/all';
     var CACHE_KEY = 'plex_watchlist_cache';
-    var CACHE_SCHEMA = 3;
+    var CACHE_SCHEMA = 4;
     var CLIENT_ID_KEY = 'plex_watchlist_client_id';
     var PAGE_SIZE = 20;
     var PLEX_ROW_SIZE = 24;
@@ -57,6 +57,7 @@
         registerPlaybackSync();
         registerPlexRows();
         registerPlexMarkers();
+        registerShotsHider();
 
         console.log('Plex Watchlist', 'started', VERSION);
     }
@@ -105,9 +106,6 @@
         var cache = Lampa.Storage.get(CACHE_KEY, {});
 
         if (cache.schema !== CACHE_SCHEMA) {
-            cache.watchlist = {};
-            cache.watchlist_removed = {};
-            cache.watchlist_checked = {};
             cache.lampa = {};
             cache.schema = CACHE_SCHEMA;
         }
@@ -620,6 +618,14 @@
             'right:auto;',
             'z-index:2;',
             'white-space:nowrap;',
+            '}',
+            '.card__age[data-plex-episode-date]{',
+            'white-space:normal;',
+            'overflow:visible;',
+            'text-overflow:clip;',
+            '}',
+            '.plex-watchlist-hidden-row{',
+            'display:none!important;',
             '}'
         ].join('');
 
@@ -662,6 +668,30 @@
         }
     }
 
+    function safeContentRow(loader) {
+        return function (call) {
+            var completed = false;
+            var timer = setTimeout(function () {
+                finish();
+            }, 25000);
+
+            function finish(row) {
+                if (completed) return;
+
+                completed = true;
+                clearTimeout(timer);
+                call(row);
+            }
+
+            try {
+                loader(finish);
+            } catch (e) {
+                console.log('Plex Watchlist', 'content row failed', e);
+                finish();
+            }
+        };
+    }
+
     function registerPlexRows() {
         if (plexRowsRegistered || !Lampa.ContentRows || !Lampa.ContentRows.add) return;
 
@@ -678,13 +708,13 @@
                 if (screen == 'category' && params.url == 'movie') return;
                 if (screen == 'category' && params.url && params.url != 'tv' && params.url != 'anime') return;
 
-                return function (call) {
+                return safeContentRow(function (call) {
                     loadPlexContinueWatching(function (cards) {
                         call(makePlexRow('Продолжить просмотр', cards));
                     }, function () {
                         call();
                     });
-                };
+                });
             }
         });
 
@@ -698,13 +728,13 @@
                 if (screen == 'category' && params.url == 'movie') return;
                 if (screen == 'category' && params.url && params.url != 'tv' && params.url != 'anime') return;
 
-                return function (call) {
+                return safeContentRow(function (call) {
                     loadPlexRecentlyAired(function (cards) {
                         call(makePlexRow('Новые эпизоды', cards));
                     }, function () {
                         call();
                     });
-                };
+                });
             }
         });
 
@@ -716,13 +746,13 @@
             call: function () {
                 if (!token()) return;
 
-                return function (call) {
+                return safeContentRow(function (call) {
                     loadPlexWatchlistRow(function (cards) {
                         call(makePlexRow(WATCHLIST_TITLE, cards));
                     }, function () {
                         call();
                     });
-                };
+                });
             }
         });
 
@@ -734,13 +764,13 @@
             call: function (params) {
                 if (!token() || params.url != 'movie') return;
 
-                return function (call) {
+                return safeContentRow(function (call) {
                     loadPlexMovieHistory(function (cards) {
                         call(makePlexRow('Вы смотрели', cards));
                     }, function () {
                         call();
                     });
-                };
+                });
             }
         });
     }
@@ -1115,7 +1145,7 @@
     }
 
     function formatEpisodeAirDate(value) {
-        var months = ['янв.', 'фев.', 'мар.', 'апр.', 'мая', 'июн.', 'июл.', 'авг.', 'сен.', 'окт.', 'ноя.', 'дек.'];
+        var months = ['января', 'февраля', 'марта', 'апреля', 'мая', 'июня', 'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря'];
         var found = (value || '').toString().match(/(\d{4})-(\d{1,2})-(\d{1,2})/);
         var month;
         var day;
@@ -1131,7 +1161,7 @@
     }
 
     function shouldEnrichEpisode(item) {
-        return normalizePlexType(item && item.type) == 'episode' && (!episodeShowTitle(item) || !item.parentIndex || !item.index || !episodeAirDate(item));
+        return normalizePlexType(item && item.type) == 'episode';
     }
 
     function mergeEpisodeDetail(item, detail) {
@@ -1405,6 +1435,36 @@
         }
 
         if (!plexMarkerInterval) plexMarkerInterval = setInterval(scanPlexMarkers, 3000);
+    }
+
+    function hideShotsRows() {
+        var rows = document.querySelectorAll('.items-line');
+
+        Array.prototype.forEach.call(rows, function (row) {
+            var title = row.querySelector('.items-line__title');
+            var text = title ? (title.textContent || '').trim().toLowerCase() : '';
+
+            if (text == 'shots') row.classList.add('plex-watchlist-hidden-row');
+        });
+    }
+
+    function scheduleShotsHide() {
+        setTimeout(hideShotsRows, 300);
+        setTimeout(hideShotsRows, 1200);
+    }
+
+    function registerShotsHider() {
+        scheduleShotsHide();
+
+        if (Lampa.Listener && Lampa.Listener.follow) {
+            Lampa.Listener.follow('activity', function (event) {
+                if (event && (event.type == 'create' || event.type == 'start')) scheduleShotsHide();
+            });
+
+            Lampa.Listener.follow('state:changed', scheduleShotsHide);
+        }
+
+        setInterval(hideShotsRows, 3000);
     }
 
     function toggleCardWatchlist(card, doneCallback, options) {
@@ -2433,15 +2493,19 @@
         var showTitle = isEpisode ? episodeShowTitle(item) : '';
         var title = isEpisode ? showTitle || item.title : item.title;
         var ratingKey = isEpisode ? item.grandparentRatingKey || item.parentRatingKey || item.ratingKey : item.ratingKey;
-        var guid = isEpisode ? item.grandparentGuid || item.parentGuid || item.guid : item.guid;
+        var guid = isEpisode ? item.grandparentGuid || item.showGuid || '' : item.guid;
         var year = isEpisode ? item.grandparentYear || item.parentYear || item.year || ((item.originallyAvailableAt || '').match(/\d{4}/) || [''])[0] : item.grandparentYear || item.year || ((item.originallyAvailableAt || '').match(/\d{4}/) || [''])[0];
+        var episodeYear = isEpisode ? ((episodeAirDate(item) || '').match(/\d{4}/) || [''])[0] : '';
         var thumb = isEpisode ? item.grandparentThumb || item.parentThumb || item.thumb : item.thumb;
         var art = isEpisode ? item.grandparentArt || item.parentArt || item.art : item.art;
+
+        if (isEpisode && episodeYear && year == episodeYear && !item.grandparentYear && !item.parentYear) year = '';
+
         var card = {
             id: 'plex_' + (ratingKey || item.ratingKey || item.id || Date.now()),
             title: title,
             original_title: title,
-            release_date: item.originallyAvailableAt || (year ? year + '-01-01' : ''),
+            release_date: isEpisode ? (year ? year + '-01-01' : '') : item.originallyAvailableAt || (year ? year + '-01-01' : ''),
             poster: thumb,
             img: thumb,
             background_image: art || '',
@@ -2458,7 +2522,7 @@
         if (isShow) {
             card.name = title;
             card.original_name = title;
-            card.first_air_date = item.originallyAvailableAt || card.release_date;
+            card.first_air_date = card.release_date;
         }
 
         if (isEpisode) attachEpisodeFields(card, item);
@@ -2471,13 +2535,21 @@
 
     function attachTmdbIdFromGuids(card, item) {
         var guids = [];
+        var episodeCard = !!(card && card.plex_episode_label);
 
-        asArray(item.Guid).forEach(function (guid) {
-            if (guid && guid.id) guids.push(guid.id);
-        });
+        if (card && card.plex_guid) guids.push(card.plex_guid);
 
-        if (item.guid) guids.push(item.guid);
-        if (item.parentGuid) guids.push(item.parentGuid);
+        if (episodeCard && !card.plex_guid) return;
+
+        if (!episodeCard) {
+            asArray(item.Guid).forEach(function (guid) {
+                if (guid && guid.id) guids.push(guid.id);
+            });
+
+            if (item.guid) guids.push(item.guid);
+            if (item.parentGuid) guids.push(item.parentGuid);
+        }
+
         if (item.grandparentGuid) guids.push(item.grandparentGuid);
         if (item.primaryGuid) guids.push(item.primaryGuid);
 
