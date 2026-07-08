@@ -2,7 +2,7 @@
     'use strict';
 
     var PLUGIN_ID = 'plex_watchlist';
-    var VERSION = '0.4.1';
+    var VERSION = '0.4.2';
     var WATCHLIST_TITLE = 'Очередь';
     var WATCHLIST_FROM_TITLE = 'Очереди';
     var PLEX = 'https://plex.tv';
@@ -12,7 +12,7 @@
     var COMMUNITY = 'https://community.plex.tv';
     var WATCHLIST_PATH = '/library/sections/watchlist/all';
     var CACHE_KEY = 'plex_watchlist_cache';
-    var CACHE_SCHEMA = 2;
+    var CACHE_SCHEMA = 3;
     var CLIENT_ID_KEY = 'plex_watchlist_client_id';
     var PAGE_SIZE = 20;
     var PLEX_ROW_SIZE = 24;
@@ -325,10 +325,16 @@
     function attachEpisodeFields(card, item) {
         var season = item.plex_episode_season || item.parentIndex || item.season || item.seasonNumber || (item.parent && item.parent.index) || '';
         var episode = item.plex_episode_number || item.index || item.episode || item.episodeNumber || '';
+        var airDate = item.plex_episode_air_date || episodeAirDate(item);
 
         if (season) card.plex_episode_season = parseInt(season, 10) || season;
         if (episode) card.plex_episode_number = parseInt(episode, 10) || episode;
         if (card.plex_episode_season || card.plex_episode_number) card.plex_episode_label = episodeLabel(card.plex_episode_season, card.plex_episode_number);
+
+        if (airDate) {
+            card.plex_episode_air_date = airDate;
+            card.plex_episode_air_date_label = formatEpisodeAirDate(airDate);
+        }
 
         if (item.ratingKey || item.id || item.key) card.plex_episode_rating_key = metadataRatingKey(item);
     }
@@ -610,19 +616,8 @@
             'margin-bottom:1em;',
             '}',
             '.card__plex-episode{',
-            'position:absolute;',
-            'left:.45em;',
-            'bottom:.45em;',
-            'min-width:2.2em;',
-            'box-sizing:border-box;',
-            'padding:.2em .55em;',
-            'border-radius:1em;',
-            'background:rgba(0,0,0,.62);',
-            'color:#fff;',
-            'font-size:.95em;',
-            'font-weight:700;',
-            'line-height:1.25;',
-            'text-align:center;',
+            'left:.3em;',
+            'right:auto;',
             'z-index:2;',
             'white-space:nowrap;',
             '}'
@@ -696,7 +691,7 @@
         Lampa.ContentRows.add({
             name: 'plex_recent_episodes',
             title: 'Новые эпизоды',
-            index: 2,
+            index: 3,
             screen: ['main', 'category'],
             call: function (params, screen) {
                 if (!token()) return;
@@ -706,6 +701,24 @@
                 return function (call) {
                     loadPlexRecentlyAired(function (cards) {
                         call(makePlexRow('Новые эпизоды', cards));
+                    }, function () {
+                        call();
+                    });
+                };
+            }
+        });
+
+        Lampa.ContentRows.add({
+            name: 'plex_watchlist_row',
+            title: WATCHLIST_TITLE,
+            index: 2,
+            screen: ['main'],
+            call: function () {
+                if (!token()) return;
+
+                return function (call) {
+                    loadPlexWatchlistRow(function (cards) {
+                        call(makePlexRow(WATCHLIST_TITLE, cards));
                     }, function () {
                         call();
                     });
@@ -861,13 +874,16 @@
         var tried = {};
 
         if (options.identifier) {
-            sources.unshift({
+            var identifierSource = {
                 path: '/hubs',
                 params: {
                     identifier: options.identifier
                 },
                 allowAll: true
-            });
+            };
+
+            if (options.identifierFirst === false) sources.splice(1, 0, identifierSource);
+            else sources.unshift(identifierSource);
         }
 
         function next() {
@@ -937,7 +953,9 @@
             'continue',
             'home.ondeck'
         ], function (items) {
-            hydratePlexItems(items, 'continue', success);
+            hydratePlexItems(items, 'continue', success, {
+                enrichEpisodes: true
+            });
         }, fail, {
             identifier: 'watchlist.continueWatching,continueWatching,home.continue,movies.continueWatching,home.ondeck'
         });
@@ -954,10 +972,24 @@
             'home.television.recent',
             'home.ondeck'
         ], function (items) {
-            hydratePlexItems(items, 'recent_episodes', success);
+            var episodes = items.filter(isPlexEpisodeLike);
+
+            hydratePlexItems(episodes.length ? episodes : items, 'recent_episodes', success, {
+                enrichEpisodes: true
+            });
         }, fail, {
-            identifier: 'home.television.recent,home.ondeck'
+            identifier: 'home.television.recent,home.ondeck',
+            identifierFirst: false
         });
+    }
+
+    function loadPlexWatchlistRow(success, fail) {
+        loadWatchlist(1, function (data) {
+            var cards = data && data.results ? data.results.slice(0, PLEX_ROW_SIZE) : [];
+
+            if (cards.length) success(cards);
+            else if (fail) fail();
+        }, fail);
     }
 
     function plexAccountId(data) {
@@ -1066,37 +1098,176 @@
         }, fail);
     }
 
-    function hydratePlexItems(items, rowKind, success, options) {
-        options = options || {};
+    function episodeShowTitle(item) {
+        item = item || {};
 
-        var cards = [];
+        return item.grandparentTitle || item.showTitle || item.seriesTitle || item.grandparentName || item.grandparent && item.grandparent.title || '';
+    }
 
-        items.forEach(function (item) {
-            var card = plexToLampaCard(item);
+    function isPlexEpisodeLike(item) {
+        return normalizePlexType(item && item.type) == 'episode' || !!(item && (item.grandparentTitle || item.parentIndex || item.episodeNumber));
+    }
 
-            if (!card || !cardTitle(card)) return;
+    function episodeAirDate(item) {
+        item = item || {};
 
-            card.plex_row_kind = rowKind;
-            card.plex_watched = options.watched || metadataWatched(item);
-            card.plex_watchlisted = metadataWatchlisted(item);
-            applyPlexCardDecorations(card);
-            cards.push(card);
+        return item.episodeOriginallyAvailableAt || item.airDate || item.originallyAvailableAt || item.publishedAt || item.originallyAvailable || '';
+    }
+
+    function formatEpisodeAirDate(value) {
+        var months = ['янв.', 'фев.', 'мар.', 'апр.', 'мая', 'июн.', 'июл.', 'авг.', 'сен.', 'окт.', 'ноя.', 'дек.'];
+        var found = (value || '').toString().match(/(\d{4})-(\d{1,2})-(\d{1,2})/);
+        var month;
+        var day;
+
+        if (!found) return '';
+
+        month = parseInt(found[2], 10);
+        day = parseInt(found[3], 10);
+
+        if (!day || month < 1 || month > 12) return '';
+
+        return day + ' ' + months[month - 1];
+    }
+
+    function shouldEnrichEpisode(item) {
+        return normalizePlexType(item && item.type) == 'episode' && (!episodeShowTitle(item) || !item.parentIndex || !item.index || !episodeAirDate(item));
+    }
+
+    function mergeEpisodeDetail(item, detail) {
+        var merged = {};
+        var fields = [
+            'grandparentTitle',
+            'grandparentRatingKey',
+            'grandparentGuid',
+            'grandparentThumb',
+            'grandparentArt',
+            'grandparentYear',
+            'parentTitle',
+            'parentRatingKey',
+            'parentGuid',
+            'parentThumb',
+            'parentIndex',
+            'index',
+            'originallyAvailableAt',
+            'publishedAt',
+            'year',
+            'Guid',
+            'UserState'
+        ];
+
+        for (var key in item) {
+            if (item.hasOwnProperty(key)) merged[key] = item[key];
+        }
+
+        fields.forEach(function (name) {
+            if ((merged[name] === undefined || merged[name] === null || merged[name] === '') && detail && detail[name] !== undefined && detail[name] !== null && detail[name] !== '') {
+                merged[name] = detail[name];
+            }
         });
 
-        if (!cards.length) {
-            success([]);
+        if (!merged.ratingKey && detail && detail.ratingKey) merged.ratingKey = detail.ratingKey;
+        if (!merged.key && detail && detail.key) merged.key = detail.key;
+        if (!merged.type && detail && detail.type) merged.type = detail.type;
+
+        return merged;
+    }
+
+    function enrichEpisodeItem(item, done) {
+        var ratingKey = metadataRatingKey(item);
+
+        if (!ratingKey || !shouldEnrichEpisode(item)) {
+            done(item);
             return;
         }
 
-        rememberPlexCards(cards);
+        request('GET', METADATA + '/library/metadata/' + encodeURIComponent(ratingKey), {
+            includeGuids: 1,
+            includeUserState: 1
+        }, function (data) {
+            var detail = collectMetadata(data)[0];
 
-        hydrateLampaCards(cards, function (hydrated) {
-            hydrated.forEach(function (card) {
+            done(detail ? mergeEpisodeDetail(item, detail) : item);
+        }, function () {
+            done(item);
+        });
+    }
+
+    function preparePlexItems(items, options, done) {
+        var out = items.slice();
+        var cursor = 0;
+        var active = 0;
+        var finished = 0;
+        var completed = false;
+
+        if (!options.enrichEpisodes || !items.length) {
+            done(out);
+            return;
+        }
+
+        function complete() {
+            if (completed) return;
+
+            completed = true;
+            done(out);
+        }
+
+        function next() {
+            if (finished >= items.length && active === 0) {
+                complete();
+                return;
+            }
+
+            while (active < LAMPA_CARD_CONCURRENCY && cursor < items.length) {
+                (function (index) {
+                    active++;
+
+                    enrichEpisodeItem(items[index], function (item) {
+                        out[index] = item || items[index];
+                        active--;
+                        finished++;
+                        next();
+                    });
+                })(cursor++);
+            }
+        }
+
+        next();
+    }
+
+    function hydratePlexItems(items, rowKind, success, options) {
+        options = options || {};
+
+        preparePlexItems(items, options, function (prepared) {
+            var cards = [];
+
+            prepared.forEach(function (item) {
+                var card = plexToLampaCard(item);
+
+                if (!card || !cardTitle(card)) return;
+
+                card.plex_row_kind = rowKind;
+                card.plex_watched = options.watched || metadataWatched(item);
+                card.plex_watchlisted = metadataWatchlisted(item);
                 applyPlexCardDecorations(card);
+                cards.push(card);
             });
 
-            rememberPlexCards(hydrated);
-            success(hydrated);
+            if (!cards.length) {
+                success([]);
+                return;
+            }
+
+            rememberPlexCards(cards);
+
+            hydrateLampaCards(cards, function (hydrated) {
+                hydrated.forEach(function (card) {
+                    applyPlexCardDecorations(card);
+                });
+
+                rememberPlexCards(hydrated);
+                success(hydrated);
+            });
         });
     }
 
@@ -1161,6 +1332,7 @@
         if (isCardWatchlisted(card) || card.plex_watchlisted) addCardIcon(element, 'wath');
         if (isCardWatched(card) || card.plex_watched) addCardIcon(element, 'history');
         if (card.plex_episode_label) addEpisodeBadge(element, card.plex_episode_label);
+        if (card.plex_episode_air_date_label) addEpisodeAirDate(element, card.plex_episode_air_date_label);
     }
 
     function addCardIcon(element, name) {
@@ -1183,11 +1355,28 @@
 
         if (!badge) {
             badge = document.createElement('div');
-            badge.className = 'card__plex-episode';
+            badge.className = 'card__vote card__plex-episode';
             view.appendChild(badge);
+        } else if (!badge.classList.contains('card__vote')) {
+            badge.className = 'card__vote card__plex-episode';
         }
 
         badge.textContent = label;
+    }
+
+    function addEpisodeAirDate(element, label) {
+        var age = element.querySelector('.card__age');
+        var base;
+
+        if (!age || !label) return;
+        if (age.getAttribute('data-plex-episode-date') == label) return;
+
+        base = age.getAttribute('data-plex-base-age') || age.textContent || '';
+        base = base.replace(/\s+•.*$/, '').trim();
+
+        age.setAttribute('data-plex-base-age', base);
+        age.setAttribute('data-plex-episode-date', label);
+        age.textContent = base ? base + ' • ' + label : label;
     }
 
     function scanPlexMarkers() {
@@ -1875,6 +2064,8 @@
         target.plex_episode_season = source.plex_episode_season || '';
         target.plex_episode_number = source.plex_episode_number || '';
         target.plex_episode_label = source.plex_episode_label || '';
+        target.plex_episode_air_date = source.plex_episode_air_date || '';
+        target.plex_episode_air_date_label = source.plex_episode_air_date_label || '';
         target.plex_row_kind = source.plex_row_kind || '';
         target.plex_watched = !!source.plex_watched;
         target.plex_watchlisted = !!source.plex_watchlisted;
@@ -1960,8 +2151,80 @@
         });
     }
 
+    function lampaSearchParams(card) {
+        var year = releaseYear(card);
+        var isShow = cardType(card) == 'show';
+        var titles = [
+            cardTitle(card),
+            card.plex_title,
+            card.original_title,
+            card.original_name
+        ];
+        var out = [];
+        var seen = {};
+
+        function add(title, mode) {
+            var normalized = normalizeTitle(title);
+            var params;
+
+            if (!normalized) return;
+
+            if (mode == 'year_text' && !year) return;
+
+            params = {
+                query: encodeURIComponent(mode == 'year_text' ? title + ' ' + year : title)
+            };
+
+            if (mode == 'filter' && year) {
+                params.filter = {};
+                params.filter[isShow ? 'first_air_date_year' : 'primary_release_year'] = year;
+            }
+
+            var key = JSON.stringify(params);
+
+            if (!seen[key]) {
+                seen[key] = true;
+                out.push(params);
+            }
+        }
+
+        titles.forEach(function (title) {
+            add(title, 'filter');
+        });
+
+        titles.forEach(function (title) {
+            add(title, 'year_text');
+        });
+
+        titles.forEach(function (title) {
+            add(title, 'plain');
+        });
+
+        return out;
+    }
+
+    function requestLampaSearch(params, onResult, onFail) {
+        try {
+            if (typeof Lampa.Api.search === 'function') {
+                Lampa.Api.search(params, onResult);
+                return;
+            }
+
+            if (Lampa.Api.sources && Lampa.Api.sources.tmdb && typeof Lampa.Api.sources.tmdb.search === 'function') {
+                Lampa.Api.sources.tmdb.search(params, onResult);
+                return;
+            }
+
+            onFail();
+        } catch (e) {
+            console.log('Plex Watchlist', 'Lampa card search failed', e);
+            onFail();
+        }
+    }
+
     function searchLampaCard(card, done) {
-        var query = cardTitle(card);
+        var searches = lampaSearchParams(card);
+        var index = 0;
         var handled = false;
         var timer = setTimeout(function () {
             finish(null);
@@ -1975,31 +2238,28 @@
             done(result);
         }
 
-        function onResult(data) {
-            finish(pickBestLampaMatch(card, collectLampaSearchResults(data)));
+        function next() {
+            if (handled) return;
+
+            if (index >= searches.length) {
+                finish(null);
+                return;
+            }
+
+            requestLampaSearch(searches[index++], function (data) {
+                var found = pickBestLampaMatch(card, collectLampaSearchResults(data));
+
+                if (found) finish(found);
+                else next();
+            }, next);
         }
 
-        if (!query || !Lampa.Api) {
+        if (!searches.length || !Lampa.Api) {
             finish(null);
             return;
         }
 
-        try {
-            if (typeof Lampa.Api.search === 'function') {
-                Lampa.Api.search({ query: encodeURIComponent(query) }, onResult);
-                return;
-            }
-
-            if (Lampa.Api.sources && Lampa.Api.sources.tmdb && typeof Lampa.Api.sources.tmdb.search === 'function') {
-                Lampa.Api.sources.tmdb.search({ query: encodeURIComponent(query) }, onResult);
-                return;
-            }
-
-            finish(null);
-        } catch (e) {
-            console.log('Plex Watchlist', 'Lampa card search failed', e);
-            finish(null);
-        }
+        next();
     }
 
     function collectLampaSearchResults(data) {
@@ -2069,6 +2329,7 @@
 
                 if (diff === 0) score += 30;
                 else if (diff <= 1) score += 8;
+                else if (diff > 2) score -= 35;
             }
 
             if (item.poster_path) score += 4;
@@ -2169,10 +2430,11 @@
         var type = normalizePlexType(item.type);
         var isEpisode = type == 'episode';
         var isShow = type == 'show' || type == 'season' || isEpisode;
-        var title = isEpisode ? item.grandparentTitle || item.parentTitle || item.title : item.title;
+        var showTitle = isEpisode ? episodeShowTitle(item) : '';
+        var title = isEpisode ? showTitle || item.title : item.title;
         var ratingKey = isEpisode ? item.grandparentRatingKey || item.parentRatingKey || item.ratingKey : item.ratingKey;
         var guid = isEpisode ? item.grandparentGuid || item.parentGuid || item.guid : item.guid;
-        var year = item.grandparentYear || item.year || ((item.originallyAvailableAt || '').match(/\d{4}/) || [''])[0];
+        var year = isEpisode ? item.grandparentYear || item.parentYear || item.year || ((item.originallyAvailableAt || '').match(/\d{4}/) || [''])[0] : item.grandparentYear || item.year || ((item.originallyAvailableAt || '').match(/\d{4}/) || [''])[0];
         var thumb = isEpisode ? item.grandparentThumb || item.parentThumb || item.thumb : item.thumb;
         var art = isEpisode ? item.grandparentArt || item.parentArt || item.art : item.art;
         var card = {
