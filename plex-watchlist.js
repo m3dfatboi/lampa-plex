@@ -2,13 +2,16 @@
     'use strict';
 
     var PLUGIN_ID = 'plex_watchlist';
-    var VERSION = '0.3.0';
-    var WATCHLIST_TITLE = 'Буду смотреть';
+    var VERSION = '0.3.1';
+    var WATCHLIST_TITLE = 'Очередь';
+    var WATCHLIST_FROM_TITLE = 'Очереди';
     var PLEX = 'https://plex.tv';
     var DISCOVER = 'https://discover.provider.plex.tv';
+    var DISCOVER_IDENTIFIER = 'tv.plex.provider.discover';
     var METADATA = 'https://metadata.provider.plex.tv';
     var WATCHLIST_PATH = '/library/sections/watchlist/all';
     var CACHE_KEY = 'plex_watchlist_cache';
+    var CACHE_SCHEMA = 2;
     var CLIENT_ID_KEY = 'plex_watchlist_client_id';
     var PAGE_SIZE = 20;
     var AUTH_POLL_INTERVAL = 3000;
@@ -89,9 +92,17 @@
     function getCache() {
         var cache = Lampa.Storage.get(CACHE_KEY, {});
 
+        if (cache.schema !== CACHE_SCHEMA) {
+            cache.watchlist = {};
+            cache.watchlist_removed = {};
+            cache.watchlist_checked = {};
+            cache.schema = CACHE_SCHEMA;
+        }
+
         cache.items = cache.items || {};
         cache.watchlist = cache.watchlist || {};
         cache.watchlist_removed = cache.watchlist_removed || {};
+        cache.watchlist_checked = cache.watchlist_checked || {};
         cache.episodes = cache.episodes || {};
 
         return cache;
@@ -330,7 +341,7 @@
 
     function isCachedWatchlisted(ratingKey) {
         var cache = getCache();
-        return !!cache.watchlist[ratingKey];
+        return !!(cache.watchlist[ratingKey] && cache.watchlist_checked[ratingKey] && !cache.watchlist_removed[ratingKey]);
     }
 
     function isCachedWatchlistRemoved(ratingKey) {
@@ -353,6 +364,8 @@
     function setCachedWatchlisted(ratingKey, status) {
         var cache = getCache();
 
+        cache.watchlist_checked[ratingKey] = Date.now();
+
         if (status) {
             cache.watchlist[ratingKey] = Date.now();
             delete cache.watchlist_removed[ratingKey];
@@ -362,6 +375,18 @@
         }
 
         saveCache(cache);
+    }
+
+    function isUserStateWatchlisted(state) {
+        return !!(state && (state.watchlistedAt || state.watchlist || state.watchlisted));
+    }
+
+    function syncCachedUserState(ratingKey, state) {
+        var onList = isUserStateWatchlisted(state);
+
+        setCachedWatchlisted(ratingKey, onList);
+
+        return onList;
     }
 
     function addToWatchlist(ratingKey, success, fail) {
@@ -379,16 +404,16 @@
     }
 
     function markPlayed(ratingKey, success, fail) {
-        request('PUT', METADATA + '/actions/scrobble', {
+        request('PUT', DISCOVER + '/actions/scrobble', {
             key: ratingKey,
-            identifier: 'com.plexapp.plugins.library'
+            identifier: DISCOVER_IDENTIFIER
         }, success || function () {}, fail);
     }
 
     function ratePlexItem(ratingKey, rating, success, fail) {
-        request('PUT', METADATA + '/:/rate', {
+        request('PUT', DISCOVER + '/actions/rate', {
             key: ratingKey,
-            identifier: 'com.plexapp.plugins.library',
+            identifier: DISCOVER_IDENTIFIER,
             rating: rating
         }, success || function () {}, fail);
     }
@@ -404,12 +429,12 @@
 
         resolvePlexItem(card, function (item) {
             userState(item.ratingKey, function (state) {
-                var onList = !!(state.watchlistedAt || state.watchlist || isCachedWatchlisted(item.ratingKey) || isCardWatchlisted(card));
+                var onList = syncCachedUserState(item.ratingKey, state);
                 var done = function () {
                     var newStatus = !onList;
 
                     Lampa.Loading.stop();
-                    notify(onList ? 'Удалено из ' + WATCHLIST_TITLE : 'Добавлено в ' + WATCHLIST_TITLE);
+                    notify(onList ? 'Удалено из ' + WATCHLIST_FROM_TITLE : 'Добавлено в ' + WATCHLIST_TITLE);
                     if (doneCallback) doneCallback(newStatus, item);
                     if (options.refresh !== false) Lampa.Activity.refresh();
                 };
@@ -426,7 +451,7 @@
                     var newStatus = !onList;
 
                     Lampa.Loading.stop();
-                    notify(onList ? 'Удалено из ' + WATCHLIST_TITLE : 'Добавлено в ' + WATCHLIST_TITLE);
+                    notify(onList ? 'Удалено из ' + WATCHLIST_FROM_TITLE : 'Добавлено в ' + WATCHLIST_TITLE);
                     if (doneCallback) doneCallback(newStatus, item);
                     if (options.refresh !== false) Lampa.Activity.refresh();
                 };
@@ -438,6 +463,47 @@
                 if (onList) removeFromWatchlist(item.ratingKey, done, bad);
                 else addToWatchlist(item.ratingKey, done, bad);
             });
+        }, function () {
+            Lampa.Loading.stop();
+            notify('Не нашел этот тайтл в Plex Discover');
+        });
+    }
+
+    function setCardWatchlist(card, targetStatus, doneCallback, options) {
+        if (!token()) {
+            notify('Укажи Plex token в настройках');
+            return;
+        }
+
+        options = options || {};
+        Lampa.Loading.start();
+
+        resolvePlexItem(card, function (item) {
+            var finish = function () {
+                Lampa.Loading.stop();
+                notify(targetStatus ? 'Добавлено в ' + WATCHLIST_TITLE : 'Удалено из ' + WATCHLIST_FROM_TITLE);
+                if (doneCallback) doneCallback(targetStatus, item);
+                if (options.refresh !== false) Lampa.Activity.refresh();
+            };
+            var bad = function () {
+                Lampa.Loading.stop();
+                notify('Plex Watchlist: ошибка запроса');
+            };
+            var apply = function () {
+                if (targetStatus) addToWatchlist(item.ratingKey, finish, bad);
+                else removeFromWatchlist(item.ratingKey, finish, bad);
+            };
+
+            userState(item.ratingKey, function (state) {
+                var currentStatus = syncCachedUserState(item.ratingKey, state);
+
+                if (currentStatus == targetStatus) {
+                    finish();
+                    return;
+                }
+
+                apply();
+            }, apply);
         }, function () {
             Lampa.Loading.stop();
             notify('Не нашел этот тайтл в Plex Discover');
@@ -458,13 +524,14 @@
             active.plexWatchlistInjected = true;
 
             var onList = isCardWatchlisted(card);
+            var targetStatus = !onList;
 
             active.items.unshift({
-                title: onList ? 'Удалить из ' + WATCHLIST_TITLE : 'Добавить в ' + WATCHLIST_TITLE,
+                title: onList ? 'Удалить из ' + WATCHLIST_FROM_TITLE : 'Добавить в ' + WATCHLIST_TITLE,
                 subtitle: 'Plex Discover',
                 plex_watchlist_action: true,
                 onSelect: function () {
-                    toggleCardWatchlist(card);
+                    setCardWatchlist(card, targetStatus);
                     Lampa.Controller.toggle('content');
                 }
             });
@@ -510,7 +577,7 @@
     }
 
     function setFullWatchlistButtonState(button, onList) {
-        var label = onList ? 'Удалить из ' + WATCHLIST_TITLE : 'В ' + WATCHLIST_TITLE;
+        var label = onList ? 'Удалить из ' + WATCHLIST_FROM_TITLE : 'В ' + WATCHLIST_TITLE;
         var text = button.find('span').first();
 
         if (!text.length) {
@@ -529,7 +596,7 @@
 
         resolvePlexItem(card, function (item) {
             userState(item.ratingKey, function (state) {
-                setFullWatchlistButtonState(button, !!(state.watchlistedAt || state.watchlist || isCachedWatchlisted(item.ratingKey) || isCardWatchlisted(card)));
+                setFullWatchlistButtonState(button, syncCachedUserState(item.ratingKey, state));
             });
         });
     }
@@ -554,7 +621,7 @@
         refreshFullWatchlistButton(button, card);
 
         button.on('hover:enter', function () {
-            toggleCardWatchlist(card, function (status) {
+            setCardWatchlist(card, !button.hasClass('active'), function (status) {
                 setFullWatchlistButtonState(button, status);
             }, {
                 refresh: false
@@ -973,6 +1040,7 @@
         items.forEach(function (item) {
             if (item.plex_rating_key) {
                 cache.watchlist[item.plex_rating_key] = Date.now();
+                cache.watchlist_checked[item.plex_rating_key] = Date.now();
                 delete cache.watchlist_removed[item.plex_rating_key];
             }
         });
@@ -1366,7 +1434,7 @@
                 default: false
             },
             field: {
-                name: 'Удалять фильмы из ' + WATCHLIST_TITLE,
+                name: 'Удалять фильмы из ' + WATCHLIST_FROM_TITLE,
                 description: 'Только для фильмов после отметки просмотренным'
             }
         });
