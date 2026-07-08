@@ -2,7 +2,7 @@
     'use strict';
 
     var PLUGIN_ID = 'plex_watchlist';
-    var VERSION = '0.4.0';
+    var VERSION = '0.4.1';
     var WATCHLIST_TITLE = 'Очередь';
     var WATCHLIST_FROM_TITLE = 'Очереди';
     var PLEX = 'https://plex.tv';
@@ -119,6 +119,7 @@
         cache.lampa = cache.lampa || {};
         cache.episodes = cache.episodes || {};
         cache.watched = cache.watched || {};
+        cache.account = cache.account || {};
 
         return cache;
     }
@@ -139,11 +140,30 @@
         return list.length ? '?' + list.join('&') : '';
     }
 
+    function mergeParams(base, extra) {
+        var out = {};
+        var k;
+
+        base = base || {};
+        extra = extra || {};
+
+        for (k in base) {
+            if (base.hasOwnProperty(k)) out[k] = base[k];
+        }
+
+        for (k in extra) {
+            if (extra.hasOwnProperty(k)) out[k] = extra[k];
+        }
+
+        return out;
+    }
+
     function request(method, url, params, success, fail, options) {
         options = options || {};
 
         var xhr = new XMLHttpRequest();
-        var full = url + qs(params || {});
+        var query = qs(params || {});
+        var full = url + (query ? (url.indexOf('?') >= 0 ? '&' + query.slice(1) : query) : '');
 
         xhr.open(method, full, true);
         xhr.timeout = 20000;
@@ -726,8 +746,14 @@
             includeCollections: 1,
             includeExternalMedia: 1,
             includeGuids: 1,
+            includeMeta: 1,
             includeMetadata: 1,
+            includeExternalMetadata: 1,
+            includeLibraryPlaylists: 1,
+            includeStations: 1,
+            includeRecentChannels: 1,
             includeUserState: 1,
+            excludeFields: 'summary',
             count: PLEX_ROW_SIZE,
             'X-Plex-Container-Start': 0,
             'X-Plex-Container-Size': PLEX_ROW_SIZE
@@ -739,7 +765,9 @@
             hub && hub.title,
             hub && hub.context,
             hub && hub.key,
+            hub && hub.hubKey,
             hub && hub.hubIdentifier,
+            hub && hub.identifier,
             hub && hub.sourceURI,
             hub && hub.type
         ].join(' '));
@@ -749,15 +777,15 @@
         var hubs = asArray(mediaContainer(data).Hub);
         var picked = null;
 
-        hubs.forEach(function (hub) {
-            var text = hubText(hub);
-            var compactText = text.replace(/\s+/g, '');
+        names.forEach(function (name) {
+            var normalized = normalizeTitle(name);
+            var compact = normalized.replace(/\s+/g, '');
 
             if (picked) return;
 
-            names.forEach(function (name) {
-                var normalized = normalizeTitle(name);
-                var compact = normalized.replace(/\s+/g, '');
+            hubs.forEach(function (hub) {
+                var text = hubText(hub);
+                var compactText = text.replace(/\s+/g, '');
 
                 if (!picked && (text.indexOf(normalized) >= 0 || compactText.indexOf(compact) >= 0)) picked = hub;
             });
@@ -766,26 +794,132 @@
         return picked;
     }
 
-    function loadHubItems(names, success, fail) {
-        var paths = [
-            '/hubs/sections/watchlist/recommended',
-            '/hubs/sections/watchlist',
-            '/hubs/sections/home',
-            '/hubs'
+    function hubUrl(key) {
+        if (!key) return '';
+        key = key.toString();
+
+        if (/^https?:\/\//i.test(key)) return key;
+
+        if (key.indexOf('provider://' + DISCOVER_IDENTIFIER) === 0) {
+            return DISCOVER + key.replace('provider://' + DISCOVER_IDENTIFIER, '');
+        }
+
+        if (key.charAt(0) != '/') key = '/' + key;
+
+        return DISCOVER + key;
+    }
+
+    function hubKeys(hub) {
+        var out = [];
+
+        ['key', 'hubKey', 'sourceURI'].forEach(function (name) {
+            if (hub && hub[name] && out.indexOf(hub[name]) < 0) out.push(hub[name]);
+        });
+
+        return out;
+    }
+
+    function hubDataItems(data, names, allowAll) {
+        var hubs = asArray(mediaContainer(data).Hub);
+        var hub = pickHub(data, names);
+        var items = collectHubItems(hub);
+
+        if (!items.length && allowAll) {
+            if (!hub && hubs.length == 1) hub = hubs[0];
+            items = hub ? collectHubItems(hub) : [];
+            if (!items.length) items = collectMetadata(data);
+        }
+
+        return {
+            hub: hub,
+            items: items
+        };
+    }
+
+    function loadHubItems(names, success, fail, options) {
+        options = options || {};
+
+        var sources = [
+            {
+                path: '/hubs/sections/home',
+                allowAll: false
+            },
+            {
+                path: '/hubs',
+                allowAll: false
+            },
+            {
+                path: '/hubs/sections/watchlist/recommended',
+                allowAll: false
+            },
+            {
+                path: '/hubs/sections/watchlist',
+                allowAll: false
+            }
         ];
         var index = 0;
+        var tried = {};
+
+        if (options.identifier) {
+            sources.unshift({
+                path: '/hubs',
+                params: {
+                    identifier: options.identifier
+                },
+                allowAll: true
+            });
+        }
 
         function next() {
-            if (index >= paths.length) {
+            var source;
+
+            if (index >= sources.length) {
                 if (fail) fail();
                 return;
             }
 
-            request('GET', DISCOVER + paths[index++], hubRequestParams(), function (data) {
-                var hub = pickHub(data, names);
-                var items = collectHubItems(hub);
+            source = sources[index++];
 
-                if (items.length) success(items);
+            request('GET', hubUrl(source.path), mergeParams(hubRequestParams(), source.params), function (data) {
+                var found = hubDataItems(data, names, source.allowAll);
+
+                if (found.items.length) {
+                    success(found.items);
+                    return;
+                }
+
+                loadHubKeyItems(found.hub, names, tried, success, next);
+            }, next);
+        }
+
+        next();
+    }
+
+    function loadHubKeyItems(hub, names, tried, success, fail) {
+        var keys = hubKeys(hub);
+        var index = 0;
+
+        function next() {
+            var key;
+
+            if (index >= keys.length) {
+                if (fail) fail();
+                return;
+            }
+
+            key = keys[index++];
+
+            if (tried[key]) {
+                next();
+                return;
+            }
+
+            tried[key] = true;
+
+            request('GET', hubUrl(key), hubRequestParams(), function (data) {
+                var found = hubDataItems(data, names, true);
+
+                if (found.items.length) success(found.items);
                 else next();
             }, next);
         }
@@ -794,23 +928,87 @@
     }
 
     function loadPlexContinueWatching(success, fail) {
-        loadHubItems(['continue watching', 'continueWatching', 'continue'], function (items) {
+        loadHubItems([
+            'watchlist.continueWatching',
+            'continueWatching',
+            'home.continue',
+            'movies.continueWatching',
+            'continue watching',
+            'continue',
+            'home.ondeck'
+        ], function (items) {
             hydratePlexItems(items, 'continue', success);
-        }, fail);
+        }, fail, {
+            identifier: 'watchlist.continueWatching,continueWatching,home.continue,movies.continueWatching,home.ondeck'
+        });
     }
 
     function loadPlexRecentlyAired(success, fail) {
-        loadHubItems(['recently aired', 'recentlyAiredEpisodes', 'recent episodes', 'new episodes', 'recently released'], function (items) {
+        loadHubItems([
+            'recently aired episodes',
+            'recently aired',
+            'recentlyAiredEpisodes',
+            'recent episodes',
+            'new episodes',
+            'recently released',
+            'home.television.recent',
+            'home.ondeck'
+        ], function (items) {
             hydratePlexItems(items, 'recent_episodes', success);
+        }, fail, {
+            identifier: 'home.television.recent,home.ondeck'
+        });
+    }
+
+    function plexAccountId(data) {
+        data = data || {};
+
+        return data.uuid || data.id || data.username || (data.user && (data.user.uuid || data.user.id || data.user.username)) || '';
+    }
+
+    function loadPlexAccountId(success, fail) {
+        var cache = getCache();
+        var account = cache.account || {};
+        var fresh = account.id && account.time && Date.now() - account.time < 24 * 60 * 60 * 1000;
+
+        if (fresh) {
+            success(account.id);
+            return;
+        }
+
+        request('GET', PLEX + '/api/v2/user', {}, function (data) {
+            var id = plexAccountId(data);
+
+            if (!id) {
+                if (fail) fail();
+                return;
+            }
+
+            cache = getCache();
+            cache.account = cache.account || {};
+            cache.account.id = id;
+            cache.account.time = Date.now();
+            saveCache(cache);
+
+            success(id);
         }, fail);
     }
 
     function loadProfileWatchHistory(success, fail) {
-        graphQL(PROFILE_WATCH_HISTORY_QUERY, {
-            uuid: '',
-            first: PLEX_ROW_SIZE * 2,
-            skipUserState: false
-        }, function (data) {
+        function requestHistory(uuid, canRetryEmpty) {
+            graphQL(PROFILE_WATCH_HISTORY_QUERY, {
+                uuid: uuid || '',
+                first: PLEX_ROW_SIZE * 2,
+                skipUserState: false
+            }, function (data) {
+                parseHistory(data, uuid, canRetryEmpty);
+            }, function () {
+                if (uuid && canRetryEmpty) requestHistory('', false);
+                else if (fail) fail();
+            });
+        }
+
+        function parseHistory(data, uuid, canRetryEmpty) {
             var history = data && data.user && data.user.watchHistory ? data.user.watchHistory : {};
             var nodes = asArray(history.nodes);
             var items = [];
@@ -821,8 +1019,15 @@
             });
 
             if (items.length) success(items);
+            else if (uuid && canRetryEmpty) requestHistory('', false);
             else if (fail) fail();
-        }, fail);
+        }
+
+        loadPlexAccountId(function (id) {
+            requestHistory(id, true);
+        }, function () {
+            requestHistory('', false);
+        });
     }
 
     function loadPlexMovieHistory(success, fail) {
