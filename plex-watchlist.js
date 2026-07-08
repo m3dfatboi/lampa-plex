@@ -2,7 +2,7 @@
     'use strict';
 
     var PLUGIN_ID = 'plex_watchlist';
-    var VERSION = '0.3.4';
+    var VERSION = '0.3.5';
     var WATCHLIST_TITLE = 'Очередь';
     var WATCHLIST_FROM_TITLE = 'Очереди';
     var PLEX = 'https://plex.tv';
@@ -411,7 +411,7 @@
         var styleId = PLUGIN_ID + '_styles';
         var css = [
             '.plex-watchlist-page .category-full .card{',
-            'margin-bottom:2.2em;',
+            'margin-bottom:1em;',
             '}'
         ].join('');
 
