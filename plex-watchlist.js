@@ -2,7 +2,7 @@
     'use strict';
 
     var PLUGIN_ID = 'plex_watchlist';
-    var VERSION = '0.3.2';
+    var VERSION = '0.3.3';
     var WATCHLIST_TITLE = 'Очередь';
     var WATCHLIST_FROM_TITLE = 'Очереди';
     var PLEX = 'https://plex.tv';
@@ -97,6 +97,7 @@
             cache.watchlist = {};
             cache.watchlist_removed = {};
             cache.watchlist_checked = {};
+            cache.lampa = {};
             cache.schema = CACHE_SCHEMA;
         }
 
@@ -104,6 +105,7 @@
         cache.watchlist = cache.watchlist || {};
         cache.watchlist_removed = cache.watchlist_removed || {};
         cache.watchlist_checked = cache.watchlist_checked || {};
+        cache.lampa = cache.lampa || {};
         cache.episodes = cache.episodes || {};
 
         return cache;
@@ -1011,6 +1013,7 @@
         request('GET', DISCOVER + WATCHLIST_PATH, {
             includeCollections: 1,
             includeExternalMedia: 1,
+            includeGuids: 1,
             includeUserState: 1,
             sort: 'watchlistedAt:desc',
             'X-Plex-Container-Start': (page - 1) * PAGE_SIZE,
@@ -1064,33 +1067,235 @@
     }
 
     function hydrateLampaCard(card, done) {
-        if (!Lampa.Api || typeof Lampa.Api.full !== 'function' || typeof card.id != 'number') {
-            done(card);
+        var completed = false;
+        var timer = setTimeout(function () {
+            finish(card);
+        }, 9000);
+
+        function finish(result) {
+            if (completed) return;
+
+            completed = true;
+            clearTimeout(timer);
+            done(result || card);
+        }
+
+        function loadFull(sourceCard, lampaCard) {
+            if (!Lampa.Api || typeof Lampa.Api.full !== 'function' || typeof lampaCard.id != 'number') {
+                rememberLampaMatch(sourceCard, lampaCard);
+                finish(attachPlexFields(lampaCard, sourceCard));
+                return;
+            }
+
+            try {
+                Lampa.Api.full({
+                    id: lampaCard.id,
+                    method: cardType(sourceCard) == 'show' ? 'tv' : 'movie',
+                    card: lampaCard,
+                    source: 'tmdb'
+                }, function (data) {
+                    var movie = data && data.movie ? data.movie : null;
+
+                    if (!movie || !movie.id) {
+                        rememberLampaMatch(sourceCard, lampaCard);
+                        finish(attachPlexFields(lampaCard, sourceCard));
+                        return;
+                    }
+
+                    rememberLampaMatch(sourceCard, movie);
+                    finish(attachPlexFields(movie, sourceCard));
+                }, function () {
+                    rememberLampaMatch(sourceCard, lampaCard);
+                    finish(attachPlexFields(lampaCard, sourceCard));
+                });
+            } catch (e) {
+                console.log('Plex Watchlist', 'Lampa card full failed', e);
+                rememberLampaMatch(sourceCard, lampaCard);
+                finish(attachPlexFields(lampaCard, sourceCard));
+            }
+        }
+
+        if (!Lampa.Api) {
+            finish(card);
+            return;
+        }
+
+        var cached = cachedLampaMatch(card);
+
+        if (cached) {
+            loadFull(card, cached);
+            return;
+        }
+
+        if (typeof card.id == 'number') {
+            loadFull(card, card);
+            return;
+        }
+
+        searchLampaCard(card, function (found) {
+            if (found && found.id) loadFull(card, found);
+            else finish(card);
+        });
+    }
+
+    function searchLampaCard(card, done) {
+        var query = cardTitle(card);
+        var handled = false;
+        var timer = setTimeout(function () {
+            finish(null);
+        }, 7000);
+
+        function finish(result) {
+            if (handled) return;
+
+            handled = true;
+            clearTimeout(timer);
+            done(result);
+        }
+
+        function onResult(data) {
+            finish(pickBestLampaMatch(card, collectLampaSearchResults(data)));
+        }
+
+        if (!query || !Lampa.Api) {
+            finish(null);
             return;
         }
 
         try {
-            Lampa.Api.full({
-                id: card.id,
-                method: cardType(card) == 'show' ? 'tv' : 'movie',
-                card: card,
-                source: 'tmdb'
-            }, function (data) {
-                var movie = data && data.movie ? data.movie : null;
+            if (typeof Lampa.Api.search === 'function') {
+                Lampa.Api.search({ query: encodeURIComponent(query) }, onResult);
+                return;
+            }
 
-                if (!movie || !movie.id) {
-                    done(card);
-                    return;
-                }
+            if (Lampa.Api.sources && Lampa.Api.sources.tmdb && typeof Lampa.Api.sources.tmdb.search === 'function') {
+                Lampa.Api.sources.tmdb.search({ query: encodeURIComponent(query) }, onResult);
+                return;
+            }
 
-                done(attachPlexFields(movie, card));
-            }, function () {
-                done(card);
-            });
+            finish(null);
         } catch (e) {
-            console.log('Plex Watchlist', 'Lampa card hydrate failed', e);
-            done(card);
+            console.log('Plex Watchlist', 'Lampa card search failed', e);
+            finish(null);
         }
+    }
+
+    function collectLampaSearchResults(data) {
+        var out = [];
+
+        function append(row, type) {
+            if (!row || !row.results) return;
+
+            asArray(row.results).forEach(function (item) {
+                if (!item || !item.id) return;
+
+                item.plex_lampa_type = type || row.type || '';
+                out.push(item);
+            });
+        }
+
+        if (Array.isArray(data)) {
+            data.forEach(function (row) {
+                append(row, row.type);
+            });
+        } else {
+            append(data && data.movie, 'movie');
+            append(data && data.tv, 'tv');
+        }
+
+        return out;
+    }
+
+    function pickBestLampaMatch(sourceCard, results) {
+        var wantedType = cardType(sourceCard) == 'show' ? 'tv' : 'movie';
+        var wantedYear = releaseYear(sourceCard);
+        var wantedTitles = [
+            normalizeTitle(cardTitle(sourceCard)),
+            normalizeTitle(sourceCard.plex_title),
+            normalizeTitle(sourceCard.original_title),
+            normalizeTitle(sourceCard.original_name)
+        ];
+        var best = null;
+        var bestScore = -1;
+
+        results.forEach(function (item) {
+            var itemType = item.plex_lampa_type || (item.name || item.original_name ? 'tv' : 'movie');
+            var itemYear = releaseYear(item);
+            var titles = [
+                normalizeTitle(item.title),
+                normalizeTitle(item.name),
+                normalizeTitle(item.original_title),
+                normalizeTitle(item.original_name)
+            ];
+            var score = 0;
+
+            if (itemType && itemType != wantedType) return;
+
+            wantedTitles.forEach(function (wanted) {
+                if (!wanted) return;
+
+                titles.forEach(function (title) {
+                    if (!title) return;
+
+                    if (title == wanted) score += 60;
+                    else if (title.indexOf(wanted) >= 0 || wanted.indexOf(title) >= 0) score += 18;
+                });
+            });
+
+            if (wantedYear && itemYear) {
+                var diff = Math.abs(itemYear - wantedYear);
+
+                if (diff === 0) score += 30;
+                else if (diff <= 1) score += 8;
+            }
+
+            if (item.poster_path) score += 4;
+            if (item.backdrop_path) score += 2;
+
+            if (score > bestScore) {
+                bestScore = score;
+                best = item;
+            }
+        });
+
+        return bestScore >= 30 ? best : null;
+    }
+
+    function rememberLampaMatch(sourceCard, lampaCard) {
+        if (!sourceCard.plex_rating_key || !lampaCard || !lampaCard.id) return;
+
+        var cache = getCache();
+
+        cache.lampa = cache.lampa || {};
+        cache.lampa[sourceCard.plex_rating_key] = {
+            id: lampaCard.id,
+            type: cardType(sourceCard) == 'show' ? 'tv' : 'movie'
+        };
+
+        saveCache(cache);
+    }
+
+    function cachedLampaMatch(card) {
+        var cache = getCache();
+        var found = cache.lampa && card.plex_rating_key ? cache.lampa[card.plex_rating_key] : null;
+
+        if (!found || !found.id) return null;
+
+        var out = {
+            id: found.id,
+            title: card.title,
+            original_title: card.original_title,
+            release_date: card.release_date,
+            source: 'tmdb'
+        };
+
+        if (found.type == 'tv') {
+            out.name = card.name || card.title;
+            out.original_name = card.original_name || card.original_title || card.title;
+            out.first_air_date = card.first_air_date || card.release_date;
+        }
+
+        return attachPlexFields(out, card);
     }
 
     function hydrateLampaCards(items, done) {
@@ -1104,6 +1309,7 @@
             done(out);
             return;
         }
+
 
         function complete() {
             if (completed) return;
@@ -1121,12 +1327,6 @@
             while (active < LAMPA_CARD_CONCURRENCY && cursor < items.length) {
                 (function (index) {
                     var item = items[index];
-
-                    if (typeof item.id != 'number') {
-                        finished++;
-                        next();
-                        return;
-                    }
 
                     active++;
 
