@@ -2,7 +2,7 @@
     'use strict';
 
     var PLUGIN_ID = 'plex_watchlist';
-    var VERSION = '0.3.1';
+    var VERSION = '0.3.2';
     var WATCHLIST_TITLE = 'Очередь';
     var WATCHLIST_FROM_TITLE = 'Очереди';
     var PLEX = 'https://plex.tv';
@@ -14,6 +14,7 @@
     var CACHE_SCHEMA = 2;
     var CLIENT_ID_KEY = 'plex_watchlist_client_id';
     var PAGE_SIZE = 20;
+    var LAMPA_CARD_CONCURRENCY = 4;
     var AUTH_POLL_INTERVAL = 3000;
     var AUTH_TIMEOUT = 15 * 60 * 1000;
 
@@ -1016,7 +1017,8 @@
             'X-Plex-Container-Size': PAGE_SIZE
         }, function (data) {
             var box = mediaContainer(data);
-            var items = collectMetadata(data).map(plexToLampaCard);
+            var plexItems = collectMetadata(data);
+            var items = plexItems.map(plexToLampaCard);
             var total = parseInt(box.totalSize || box.size || items.length, 10) || items.length;
 
             rememberWatchlist(items);
@@ -1026,10 +1028,12 @@
                 return;
             }
 
-            success({
-                results: items,
-                page: page,
-                total_pages: Math.max(1, Math.ceil(total / PAGE_SIZE))
+            hydrateLampaCards(items, function (cards) {
+                success({
+                    results: cards,
+                    page: page,
+                    total_pages: Math.max(1, Math.ceil(total / PAGE_SIZE))
+                });
             });
         }, fail);
     }
@@ -1048,6 +1052,97 @@
         saveCache(cache);
     }
 
+    function attachPlexFields(target, source) {
+        target.plex_rating_key = source.plex_rating_key;
+        target.plex_guid = source.plex_guid || '';
+        target.plex_art = source.plex_art || '';
+        target.plex_title = source.plex_title || source.title || source.name || '';
+        target.plex_tmdb_id = source.tmdb_id || (typeof source.id == 'number' ? source.id : '');
+        target.source = target.source || 'tmdb';
+
+        return target;
+    }
+
+    function hydrateLampaCard(card, done) {
+        if (!Lampa.Api || typeof Lampa.Api.full !== 'function' || typeof card.id != 'number') {
+            done(card);
+            return;
+        }
+
+        try {
+            Lampa.Api.full({
+                id: card.id,
+                method: cardType(card) == 'show' ? 'tv' : 'movie',
+                card: card,
+                source: 'tmdb'
+            }, function (data) {
+                var movie = data && data.movie ? data.movie : null;
+
+                if (!movie || !movie.id) {
+                    done(card);
+                    return;
+                }
+
+                done(attachPlexFields(movie, card));
+            }, function () {
+                done(card);
+            });
+        } catch (e) {
+            console.log('Plex Watchlist', 'Lampa card hydrate failed', e);
+            done(card);
+        }
+    }
+
+    function hydrateLampaCards(items, done) {
+        var out = items.slice();
+        var cursor = 0;
+        var active = 0;
+        var finished = 0;
+        var completed = false;
+
+        if (!items.length) {
+            done(out);
+            return;
+        }
+
+        function complete() {
+            if (completed) return;
+
+            completed = true;
+            done(out);
+        }
+
+        function next() {
+            if (finished >= items.length && active === 0) {
+                complete();
+                return;
+            }
+
+            while (active < LAMPA_CARD_CONCURRENCY && cursor < items.length) {
+                (function (index) {
+                    var item = items[index];
+
+                    if (typeof item.id != 'number') {
+                        finished++;
+                        next();
+                        return;
+                    }
+
+                    active++;
+
+                    hydrateLampaCard(item, function (card) {
+                        out[index] = card || item;
+                        active--;
+                        finished++;
+                        next();
+                    });
+                })(cursor++);
+            }
+        }
+
+        next();
+    }
+
     function plexToLampaCard(item) {
         var isShow = item.type == 'show';
         var year = item.year || ((item.originallyAvailableAt || '').match(/\d{4}/) || [''])[0];
@@ -1062,6 +1157,7 @@
             plex_art: item.art,
             plex_guid: item.guid,
             plex_rating_key: item.ratingKey,
+            plex_title: item.title,
             source: 'tmdb',
             year: year
         };
