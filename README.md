@@ -30,7 +30,7 @@
 Финальный файл плагина для Lampa:
 
 - `https://m3dfatboi.github.io/lampa-plex/plex-watchlist.js`
-- Если Lampa держит старый кэш: `https://m3dfatboi.github.io/lampa-plex/plex-watchlist-0.5.3.js`
+- Если Lampa держит старый кэш: `https://m3dfatboi.github.io/lampa-plex/plex-watchlist-0.5.4.js`
 
 ## Ограничения MVP
 
