@@ -2,7 +2,7 @@
     'use strict';
 
     var PLUGIN_ID = 'plex_watchlist';
-    var VERSION = '0.5.14';
+    var VERSION = '0.5.16';
     var WATCHLIST_TITLE = 'Очередь';
     var WATCHLIST_FROM_TITLE = 'Очереди';
     var PLEX = 'https://plex.tv';
@@ -611,9 +611,12 @@
             state.category_filter[key] = {
                 source: createSourceState(),
                 source_page: 1,
-                done: false
+                done: false,
+                queue: []
             };
         }
+
+        state.category_filter[key].queue = state.category_filter[key].queue || [];
 
         return state.category_filter[key];
     }
@@ -621,16 +624,23 @@
     function loadFilteredLampaCategoryPage(namespace, kind, page, state, limit, createSourceState, sourceLoader, success, fail) {
         var paging = categoryFilterPagingState(state, namespace, kind, createSourceState);
         var sourceLimit;
+        var collected = [];
 
         page = parseInt(page || 1, 10) || 1;
         limit = parseInt(limit || PAGE_SIZE, 10) || PAGE_SIZE;
         sourceLimit = Math.min(limit, CATEGORY_FILTER_SOURCE_PAGE_SIZE);
 
-        function deliver(cards) {
-            var hasMore = !paging.done;
+        function drainQueue() {
+            while (paging.queue.length && collected.length < limit) {
+                collected.push(paging.queue.shift());
+            }
+        }
+
+        function deliver() {
+            var hasMore = !!paging.queue.length || !paging.done;
 
             success({
-                results: cards,
+                results: collected,
                 page: page,
                 total_pages: hasMore ? page + 1 : page,
                 has_more: hasMore
@@ -640,8 +650,10 @@
         function next() {
             var sourcePage;
 
-            if (paging.done) {
-                deliver([]);
+            drainQueue();
+
+            if (collected.length >= limit || paging.done) {
+                deliver();
                 return;
             }
 
@@ -651,11 +663,18 @@
                 var cards = filterLampaCategoryCards(data && data.results, kind);
 
                 paging.done = !(data && data.has_more);
+                cards.forEach(function (card) {
+                    paging.queue.push(card);
+                });
+                drainQueue();
 
-                if (cards.length || paging.done) deliver(cards);
+                if (collected.length >= limit || paging.done) deliver();
                 else next();
             }, function () {
-                if (fail) fail();
+                paging.source_page = Math.max(1, paging.source_page - 1);
+
+                if (collected.length) deliver();
+                else if (fail) fail();
             });
         }
 
@@ -934,17 +953,6 @@
         return !!(cached && cached.ratingKey && isCachedWatchlisted(cached.ratingKey));
     }
 
-    function isCardWatched(card) {
-        var cache = getCache();
-        var direct = plexItemFromCard(card);
-        var cached = cache.items[cardKey(card)];
-
-        if (card && card.plex_watched) return true;
-        if (direct && direct.ratingKey && cache.watched[direct.ratingKey]) return true;
-
-        return !!(cached && cached.ratingKey && cache.watched[cached.ratingKey]);
-    }
-
     function parsePlexRating(value) {
         var rating = parseFloat(value);
 
@@ -1182,6 +1190,9 @@
     function registerStyles() {
         var styleId = PLUGIN_ID + '_styles';
         var css = [
+            '.card__icons-inner .icon--wath,.card__icons-inner .icon--history{',
+            'display:none!important;',
+            '}',
             '.card__plex-episode{',
             'left:.3em;',
             'right:auto;',
@@ -1680,7 +1691,7 @@
                 kind = params.url == 'anime' ? 'anime' : 'tv';
 
                 return safeContentRow(function (call) {
-                    loadCachedPlexRow('category:' + kind + ':history', function (success, fail) {
+                    loadCachedPlexRow('category:' + kind + ':history:filled', function (success, fail) {
                         loadPlexCategoryHistory(kind, success, fail);
                     }, function (cards, data) {
                         call(makePlexRow('Вы смотрели', cards, historyRowOptions(kind, 'Вы смотрели', data)));
@@ -1703,7 +1714,7 @@
                 kind = params.url == 'anime' ? 'anime' : 'tv';
 
                 return safeContentRow(function (call) {
-                    loadCachedPlexRow('category:' + kind + ':watchlist', function (success, fail) {
+                    loadCachedPlexRow('category:' + kind + ':watchlist:filled', function (success, fail) {
                         loadPlexWatchlistTypeRow(kind, success, fail);
                     }, function (cards, data) {
                         call(makePlexRow(WATCHLIST_TITLE, cards, watchlistRowOptions(kind, WATCHLIST_TITLE, data)));
@@ -3033,36 +3044,24 @@
 
         if (!element || !card) return;
 
-        if (isCardWatchlisted(card) || card.plex_watchlisted) addCardIcon(element, 'wath');
-        if (isCardWatched(card) || card.plex_watched) addCardIcon(element, 'history');
+        removeCardIcon(element, 'wath');
+        removeCardIcon(element, 'history');
         if (card.plex_episode_label) addEpisodeBadge(element, card.plex_episode_label);
         if (card.plex_episode_air_date_label) addEpisodeAirDate(element, card.plex_episode_air_date_label);
         refreshVisiblePlexState(element, card);
     }
 
-    function addCardIcon(element, name) {
-        var inner = element.querySelector('.card__icons-inner');
-
-        if (!inner) return;
-        if (inner.querySelector('.icon--' + name)) return;
-
-        var icon = document.createElement('div');
-
-        icon.className = 'card__icon icon--' + name + ' plex-watchlist-icon plex-watchlist-icon--' + name;
-        inner.appendChild(icon);
-    }
-
     function removeCardIcon(element, name) {
-        var icon = element && element.querySelector ? element.querySelector('.card__icons-inner .icon--' + name) : null;
+        var icons = element && element.querySelectorAll ? element.querySelectorAll('.card__icons-inner .icon--' + name) : [];
 
-        if (icon && icon.parentNode) icon.parentNode.removeChild(icon);
+        Array.prototype.forEach.call(icons, function (icon) {
+            if (icon.parentNode) icon.parentNode.removeChild(icon);
+        });
     }
 
-    function updateWatchedIcon(element, card, watched) {
+    function updateWatchedState(element, card, watched) {
         card.plex_watched = !!watched;
-
-        if (watched) addCardIcon(element, 'history');
-        else removeCardIcon(element, 'history');
+        removeCardIcon(element, 'history');
     }
 
     function refreshVisiblePlexState(element, card) {
@@ -3093,7 +3092,7 @@
             cache.state_checked[key] = Date.now();
             saveCache(cache);
 
-            updateWatchedIcon(element, card, sync.watched);
+            updateWatchedState(element, card, sync.watched);
         }, function () {
             cache = getCache();
             delete cache.state_loading[key];
