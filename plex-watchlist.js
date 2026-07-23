@@ -2,7 +2,7 @@
     'use strict';
 
     var PLUGIN_ID = 'plex_watchlist';
-    var VERSION = '0.5.12';
+    var VERSION = '0.5.13';
     var WATCHLIST_TITLE = 'Очередь';
     var WATCHLIST_FROM_TITLE = 'Очереди';
     var PLEX = 'https://plex.tv';
@@ -12,7 +12,10 @@
     var COMMUNITY = 'https://community.plex.tv';
     var WATCHLIST_PATH = '/library/sections/watchlist/all';
     var CACHE_KEY = 'plex_watchlist_cache';
-    var ROW_CACHE_KEY = 'plex_watchlist_rows_cache';
+    var LEGACY_ROW_CACHE_KEY = 'plex_watchlist_rows_cache';
+    var ROW_CACHE_KEY = 'plex_watchlist_rows_cache_v2';
+    var LAMPA_FULL_CARD_CACHE_KEY = 'plex_watchlist_lampa_full_cards';
+    var LAMPA_FULL_CARD_CACHE_SCHEMA = 1;
     var CACHE_SCHEMA = 8;
     var CLIENT_ID_KEY = 'plex_watchlist_client_id';
     var PAGE_SIZE = 20;
@@ -35,6 +38,13 @@
     var SHOTS_SCAN_INTERVAL = 10 * 1000;
     var CONTENT_ROW_DEADLINE = 6 * 1000;
     var LAMPA_CARD_CACHE_LIMIT = 400;
+    var LAMPA_MATCH_REFRESH_INTERVAL = 24 * 60 * 60 * 1000;
+    var LAMPA_CARD_HYDRATION_TIMEOUT = 20 * 1000;
+    var LAMPA_FULL_CARD_CACHE_TTL = 30 * 24 * 60 * 60 * 1000;
+    var LAMPA_FULL_CARD_CACHE_SAVE_DELAY = 300;
+    var LAMPA_FULL_CARD_CONCURRENCY = 4;
+    var LAMPA_FULL_CARD_REQUEST_TIMEOUT = 18 * 1000;
+    var LOCAL_WATCHLIST_TOMBSTONE_TTL = 10 * 60 * 1000;
     var LAMPA_CARD_CONCURRENCY = 4;
     var AUTH_POLL_INTERVAL = 3000;
     var AUTH_TIMEOUT = 15 * 60 * 1000;
@@ -65,6 +75,12 @@
     var plexRowLoading = {};
     var plexRowRefreshTimers = {};
     var plexRowGenerations = {};
+    var lampaFullCardCacheMemory = null;
+    var lampaFullCardCacheSaveTimer = null;
+    var lampaFullCardQueue = [];
+    var lampaFullCardRequests = {};
+    var lampaFullCardActive = 0;
+    var lampaFullCardGeneration = 0;
     var shotsHideTimer = null;
     var shotsHideFollowupTimer = null;
     var shotsHideFinalTimer = null;
@@ -198,6 +214,59 @@
         } catch (e) {
             console.log('Plex Watchlist', 'row cache save failed', e);
         }
+    }
+
+    function lampaFullCardCacheScope() {
+        var language = storageGet('tmdb_lang', storageGet('language', 'ru')) || 'ru';
+
+        return tokenFingerprint() + ':' + language;
+    }
+
+    function getLampaFullCardCache() {
+        var scope = lampaFullCardCacheScope();
+        var stored;
+
+        if (lampaFullCardCacheMemory &&
+            lampaFullCardCacheMemory.schema === LAMPA_FULL_CARD_CACHE_SCHEMA &&
+            lampaFullCardCacheMemory.scope === scope) {
+            return lampaFullCardCacheMemory;
+        }
+
+        stored = Lampa.Storage.get(LAMPA_FULL_CARD_CACHE_KEY, {}) || {};
+
+        if (stored.schema !== LAMPA_FULL_CARD_CACHE_SCHEMA || stored.scope !== scope) {
+            stored = {
+                schema: LAMPA_FULL_CARD_CACHE_SCHEMA,
+                scope: scope,
+                items: {}
+            };
+        }
+
+        stored.items = stored.items || {};
+        lampaFullCardCacheMemory = stored;
+
+        return stored;
+    }
+
+    function flushLampaFullCardCache() {
+        if (lampaFullCardCacheSaveTimer) {
+            clearTimeout(lampaFullCardCacheSaveTimer);
+            lampaFullCardCacheSaveTimer = null;
+        }
+
+        if (!lampaFullCardCacheMemory) return;
+
+        try {
+            Lampa.Storage.set(LAMPA_FULL_CARD_CACHE_KEY, lampaFullCardCacheMemory);
+        } catch (e) {
+            console.log('Plex Watchlist', 'Lampa card cache save failed', e);
+        }
+    }
+
+    function scheduleLampaFullCardCacheSave() {
+        if (lampaFullCardCacheSaveTimer) clearTimeout(lampaFullCardCacheSaveTimer);
+
+        lampaFullCardCacheSaveTimer = setTimeout(flushLampaFullCardCache, LAMPA_FULL_CARD_CACHE_SAVE_DELAY);
     }
 
     function qs(params) {
@@ -750,6 +819,12 @@
         return !!cache.watchlist_removed[ratingKey];
     }
 
+    function hasRecentWatchlistRemoval(cache, ratingKey) {
+        var removedAt = cache.watchlist_removed[ratingKey] || 0;
+
+        return !!(removedAt && Date.now() - removedAt < LOCAL_WATCHLIST_TOMBSTONE_TTL);
+    }
+
     function isCardWatchlisted(card) {
         var direct = plexItemFromCard(card);
         var cached = getCache().items[cardKey(card)];
@@ -941,6 +1016,8 @@
             });
 
             rememberPlexCards(hydrated);
+        }, {
+            full: false
         });
     }
 
@@ -1102,7 +1179,7 @@
     }
 
     function scopedPlexRowKey(name) {
-        return tokenFingerprint() + ':' + name;
+        return lampaFullCardCacheScope() + ':' + name;
     }
 
     function clonePlainValue(value) {
@@ -1142,6 +1219,30 @@
             if (name.indexOf('plex_') !== 0 || typeof card[name] == 'function') return;
 
             value = clonePlainValue(card[name]);
+            if (value !== undefined) out[name] = value;
+        });
+
+        return out;
+    }
+
+    function compactLampaCard(card) {
+        var fields = [
+            'id', 'tmdb_id', 'imdb_id', 'title', 'original_title', 'name', 'original_name',
+            'release_date', 'first_air_date', 'poster_path', 'backdrop_path', 'poster', 'img',
+            'background_image', 'overview', 'vote_average', 'vote_count', 'popularity', 'adult',
+            'genre_ids', 'genres', 'original_language', 'origin_country', 'media_type', 'type',
+            'source', 'year'
+        ];
+        var out = {};
+
+        card = card || {};
+
+        fields.forEach(function (name) {
+            var value = card[name];
+
+            if (value === undefined || typeof value == 'function') return;
+
+            value = clonePlainValue(value);
             if (value !== undefined) out[name] = value;
         });
 
@@ -2724,6 +2825,8 @@
                 cache.ratings_checked[direct.ratingKey] = Date.now();
             }
             if (card.plex_watchlisted) {
+                if (hasRecentWatchlistRemoval(cache, direct.ratingKey)) return;
+
                 cache.watchlist[direct.ratingKey] = Date.now();
                 cache.watchlist_checked[direct.ratingKey] = Date.now();
                 delete cache.watchlist_removed[direct.ratingKey];
@@ -4117,6 +4220,8 @@
 
         items.forEach(function (item) {
             if (item.plex_rating_key) {
+                if (hasRecentWatchlistRemoval(cache, item.plex_rating_key)) return;
+
                 cache.watchlist[item.plex_rating_key] = Date.now();
                 cache.watchlist_checked[item.plex_rating_key] = Date.now();
                 delete cache.watchlist_removed[item.plex_rating_key];
@@ -4127,6 +4232,25 @@
     }
 
     function attachPlexFields(target, source) {
+        var hasPoster;
+        var hasBackground;
+
+        target = target || {};
+        source = source || {};
+        hasPoster = !!(target.poster_path || target.poster || target.img);
+        hasBackground = !!(target.backdrop_path || target.background_image);
+
+        if (!hasPoster) {
+            if (source.poster_path) target.poster_path = source.poster_path;
+            if (source.poster) target.poster = source.poster;
+            if (source.img) target.img = source.img;
+        }
+
+        if (!hasBackground) {
+            if (source.backdrop_path) target.backdrop_path = source.backdrop_path;
+            if (source.background_image) target.background_image = source.background_image;
+        }
+
         target.plex_rating_key = source.plex_rating_key;
         target.plex_episode_rating_key = source.plex_episode_rating_key || '';
         target.plex_episode_season = source.plex_episode_season || '';
@@ -4147,11 +4271,13 @@
         return target;
     }
 
-    function hydrateLampaCard(card, done) {
+    function hydrateLampaCard(card, done, options) {
         var completed = false;
+        var fallbackCard = card;
+        options = options || {};
         var timer = setTimeout(function () {
-            finish(card);
-        }, 9000);
+            finish(attachPlexFields(fallbackCard, card));
+        }, LAMPA_CARD_HYDRATION_TIMEOUT);
 
         function finish(result) {
             if (completed) return;
@@ -4161,9 +4287,45 @@
             done(result || card);
         }
 
-        function useMatch(sourceCard, lampaCard) {
+        function useFallback(sourceCard, lampaCard) {
             rememberLampaMatch(sourceCard, lampaCard);
             finish(attachPlexFields(lampaCard, sourceCard));
+        }
+
+        function loadFull(sourceCard, lampaCard) {
+            fallbackCard = lampaCard || sourceCard;
+
+            if (options.full === false || !lampaCard || !lampaCard.id) {
+                useFallback(sourceCard, lampaCard);
+                return;
+            }
+
+            requestLampaFullCard(sourceCard, lampaCard, function (movie, cancelled) {
+                if (cancelled) {
+                    finish(sourceCard);
+                    return;
+                }
+
+                if (!movie || !movie.id) {
+                    useFallback(sourceCard, lampaCard);
+                    return;
+                }
+
+                rememberLampaMatch(sourceCard, movie);
+                finish(attachPlexFields(movie, sourceCard));
+            });
+        }
+
+        var cached = cachedLampaMatch(card);
+
+        if (cached) {
+            loadFull(card, cached);
+            return;
+        }
+
+        if (typeof card.id == 'number') {
+            loadFull(card, card);
+            return;
         }
 
         if (!Lampa.Api) {
@@ -4171,20 +4333,8 @@
             return;
         }
 
-        var cached = cachedLampaMatch(card);
-
-        if (cached) {
-            finish(cached);
-            return;
-        }
-
-        if (typeof card.id == 'number') {
-            useMatch(card, card);
-            return;
-        }
-
         searchLampaCard(card, function (found) {
-            if (found && found.id) useMatch(card, found);
+            if (found && found.id) loadFull(card, found);
             else finish(card);
         });
     }
@@ -4387,12 +4537,21 @@
         if (!sourceCard.plex_rating_key || !lampaCard || !lampaCard.id) return;
 
         var cache = getCache();
+        var type = cardType(sourceCard) == 'show' ? 'tv' : 'movie';
+        var previous;
         var keys;
 
         cache.lampa = cache.lampa || {};
+        previous = cache.lampa[sourceCard.plex_rating_key];
+
+        if (previous && previous.id == lampaCard.id && previous.type == type &&
+            previous.time && Date.now() - previous.time < LAMPA_MATCH_REFRESH_INTERVAL) {
+            return;
+        }
+
         cache.lampa[sourceCard.plex_rating_key] = {
             id: lampaCard.id,
-            type: cardType(sourceCard) == 'show' ? 'tv' : 'movie',
+            type: type,
             time: Date.now()
         };
 
@@ -4409,6 +4568,202 @@
         }
 
         saveCache(cache);
+    }
+
+    function lampaFullCardKey(sourceCard, lampaCard) {
+        var id = parseInt(lampaCard && lampaCard.id, 10) || 0;
+        var type = cardType(sourceCard) == 'show' ? 'tv' : 'movie';
+
+        return id ? type + ':' + id : '';
+    }
+
+    function rememberLampaFullCard(sourceCard, lampaCard, expectedScope) {
+        var cache;
+        var keys;
+        var compact;
+        var key;
+
+        if (!lampaCard || !lampaCard.id) return;
+        if (expectedScope && expectedScope !== lampaFullCardCacheScope()) return;
+
+        compact = compactLampaCard(lampaCard);
+        if (!compact.id || !cardTitle(compact)) return;
+
+        cache = getLampaFullCardCache();
+        key = lampaFullCardKey(sourceCard, compact);
+        if (!key) return;
+
+        cache.items[key] = {
+            time: Date.now(),
+            card: compact
+        };
+        keys = Object.keys(cache.items);
+
+        if (keys.length > LAMPA_CARD_CACHE_LIMIT) {
+            keys.sort(function (a, b) {
+                return (cache.items[b] && cache.items[b].time || 0) - (cache.items[a] && cache.items[a].time || 0);
+            });
+
+            keys.slice(LAMPA_CARD_CACHE_LIMIT).forEach(function (key) {
+                delete cache.items[key];
+            });
+        }
+
+        scheduleLampaFullCardCacheSave();
+    }
+
+    function cachedLampaFullCard(sourceCard, lampaCard) {
+        var cache;
+        var found;
+        var key = lampaFullCardKey(sourceCard, lampaCard);
+
+        if (!key) return null;
+
+        cache = getLampaFullCardCache();
+        found = cache.items[key];
+
+        if (!found || !found.card || !found.time) return null;
+
+        if (Date.now() - found.time > LAMPA_FULL_CARD_CACHE_TTL) {
+            delete cache.items[key];
+            scheduleLampaFullCardCacheSave();
+            return null;
+        }
+
+        return compactLampaCard(found.card);
+    }
+
+    function finishLampaFullCardRequest(job, movie) {
+        var callbacks;
+        var cancelled;
+
+        if (!job || job.settled) return;
+
+        job.settled = true;
+        clearTimeout(job.timer);
+        lampaFullCardActive = Math.max(0, lampaFullCardActive - 1);
+        if (lampaFullCardRequests[job.key] === job) delete lampaFullCardRequests[job.key];
+
+        cancelled = job.generation !== lampaFullCardGeneration || job.scope !== lampaFullCardCacheScope();
+        if (cancelled) movie = null;
+        if (movie && movie.id) rememberLampaFullCard(job.sourceCard, movie, job.scope);
+
+        callbacks = job.callbacks.slice();
+        callbacks.forEach(function (callback) {
+            try {
+                callback(movie && movie.id ? compactLampaCard(movie) : null, cancelled);
+            } catch (e) {
+                console.log('Plex Watchlist', 'Lampa card callback failed', e);
+            }
+        });
+
+        drainLampaFullCardQueue();
+    }
+
+    function startLampaFullCardRequest(job) {
+        lampaFullCardActive++;
+        job.started = true;
+        job.timer = setTimeout(function () {
+            finishLampaFullCardRequest(job, null);
+        }, LAMPA_FULL_CARD_REQUEST_TIMEOUT);
+
+        try {
+            Lampa.Api.full({
+                id: job.id,
+                method: job.method,
+                card: job.card,
+                source: 'tmdb'
+            }, function (data) {
+                var movie = data && data.movie ? data.movie : null;
+
+                if (job.settled) {
+                    if (movie && movie.id && job.generation === lampaFullCardGeneration &&
+                        job.scope === lampaFullCardCacheScope()) {
+                        rememberLampaFullCard(job.sourceCard, movie, job.scope);
+                    }
+                    return;
+                }
+
+                finishLampaFullCardRequest(job, movie);
+            }, function () {
+                finishLampaFullCardRequest(job, null);
+            });
+        } catch (e) {
+            console.log('Plex Watchlist', 'Lampa card full failed', e);
+            finishLampaFullCardRequest(job, null);
+        }
+    }
+
+    function drainLampaFullCardQueue() {
+        while (lampaFullCardActive < LAMPA_FULL_CARD_CONCURRENCY && lampaFullCardQueue.length) {
+            startLampaFullCardRequest(lampaFullCardQueue.shift());
+        }
+    }
+
+    function requestLampaFullCard(sourceCard, lampaCard, done) {
+        var cached = cachedLampaFullCard(sourceCard, lampaCard);
+        var cacheKey = lampaFullCardKey(sourceCard, lampaCard);
+        var scope = lampaFullCardCacheScope();
+        var requestKey = scope + ':' + cacheKey;
+        var job;
+
+        if (cached) {
+            done(cached, false);
+            return;
+        }
+
+        if (!cacheKey || !Lampa.Api || typeof Lampa.Api.full !== 'function') {
+            done(null, false);
+            return;
+        }
+
+        if (lampaFullCardRequests[requestKey]) {
+            lampaFullCardRequests[requestKey].callbacks.push(done);
+            return;
+        }
+
+        job = {
+            key: requestKey,
+            scope: scope,
+            generation: lampaFullCardGeneration,
+            sourceCard: sourceCard,
+            id: parseInt(lampaCard.id, 10),
+            method: cardType(sourceCard) == 'show' ? 'tv' : 'movie',
+            card: compactLampaCard(lampaCard),
+            callbacks: [done],
+            settled: false,
+            started: false,
+            timer: null
+        };
+
+        lampaFullCardRequests[requestKey] = job;
+        lampaFullCardQueue.push(job);
+        drainLampaFullCardQueue();
+    }
+
+    function cancelLampaFullCardRequests() {
+        var jobs = lampaFullCardRequests;
+
+        lampaFullCardRequests = {};
+        lampaFullCardQueue = [];
+        lampaFullCardActive = 0;
+
+        Object.keys(jobs).forEach(function (key) {
+            var job = jobs[key];
+
+            if (!job || job.settled) return;
+
+            job.settled = true;
+            clearTimeout(job.timer);
+
+            job.callbacks.forEach(function (callback) {
+                try {
+                    callback(null, true);
+                } catch (e) {
+                    console.log('Plex Watchlist', 'Lampa card cancel callback failed', e);
+                }
+            });
+        });
     }
 
     function cachedLampaMatch(card) {
@@ -4439,12 +4794,13 @@
         return attachPlexFields(out, card);
     }
 
-    function hydrateLampaCards(items, done) {
+    function hydrateLampaCards(items, done, options) {
         var out = items.slice();
         var cursor = 0;
         var active = 0;
         var finished = 0;
         var completed = false;
+        var generation = lampaFullCardGeneration;
 
         if (!items.length) {
             done(out);
@@ -4452,14 +4808,19 @@
         }
 
 
-        function complete() {
+        function complete(cancelled) {
             if (completed) return;
 
             completed = true;
-            done(out);
+            done(cancelled ? [] : out);
         }
 
         function next() {
+            if (generation !== lampaFullCardGeneration) {
+                complete(true);
+                return;
+            }
+
             if (finished >= items.length && active === 0) {
                 complete();
                 return;
@@ -4472,11 +4833,18 @@
                     active++;
 
                     hydrateLampaCard(item, function (card) {
+                        if (generation !== lampaFullCardGeneration) {
+                            active--;
+                            finished++;
+                            complete(true);
+                            return;
+                        }
+
                         out[index] = card || item;
                         active--;
                         finished++;
                         next();
-                    });
+                    }, options);
                 })(cursor++);
             }
         }
@@ -4832,14 +5200,25 @@
     function clearPlexCaches() {
         cancelPlexRowWork();
         watchedSnapshotGeneration++;
+        lampaFullCardGeneration++;
+        cancelLampaFullCardRequests();
 
         if (watchedSnapshotTimer) {
             clearTimeout(watchedSnapshotTimer);
             watchedSnapshotTimer = null;
         }
 
+        if (lampaFullCardCacheSaveTimer) {
+            clearTimeout(lampaFullCardCacheSaveTimer);
+            lampaFullCardCacheSaveTimer = null;
+        }
+
+        lampaFullCardCacheMemory = null;
+
         Lampa.Storage.set(CACHE_KEY, {});
+        Lampa.Storage.set(LEGACY_ROW_CACHE_KEY, {});
         Lampa.Storage.set(ROW_CACHE_KEY, {});
+        Lampa.Storage.set(LAMPA_FULL_CARD_CACHE_KEY, {});
     }
 
     function logoutPlex() {
