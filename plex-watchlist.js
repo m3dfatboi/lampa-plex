@@ -2,7 +2,7 @@
     'use strict';
 
     var PLUGIN_ID = 'plex_watchlist';
-    var VERSION = '0.5.17';
+    var VERSION = '0.5.18';
     var WATCHLIST_TITLE = 'Очередь';
     var WATCHLIST_FROM_TITLE = 'Очереди';
     var PLEX = 'https://plex.tv';
@@ -36,7 +36,8 @@
     var PLEX_EMPTY_ROW_CACHE_TTL = 60 * 1000;
     var PLEX_ROW_REFRESH_DELAY = 8 * 1000;
     var PLEX_MARKER_SCAN_INTERVAL = 10 * 1000;
-    var CONTENT_ROW_DEADLINE = 6 * 1000;
+    var PLEX_DEFERRED_ROW_DELAY = 180;
+    var PLEX_DEFERRED_ROW_STAGGER = 240;
     var CATEGORY_FILTER_SOURCE_PAGE_SIZE = 10;
     var LAMPA_CARD_CACHE_LIMIT = 400;
     var LAMPA_MATCH_REFRESH_INTERVAL = 24 * 60 * 60 * 1000;
@@ -76,6 +77,7 @@
     var plexRowLoading = {};
     var plexRowRefreshTimers = {};
     var plexRowGenerations = {};
+    var plexDeferredPages = [];
     var lampaFullCardCacheMemory = null;
     var lampaFullCardCacheSaveTimer = null;
     var lampaFullCardQueue = [];
@@ -1203,6 +1205,21 @@
             'white-space:normal;',
             'overflow:visible;',
             'text-overflow:clip;',
+            '}',
+            '.plex-row-deferred{',
+            'opacity:0;',
+            'transform:translateY(.35em);',
+            'transition:opacity .2s ease,transform .2s ease;',
+            '}',
+            '.plex-row-deferred--visible{',
+            'opacity:1;',
+            'transform:translateY(0);',
+            '}',
+            '.plex-row-deferred--instant{',
+            'transition:none!important;',
+            '}',
+            '@media (prefers-reduced-motion:reduce){',
+            '.plex-row-deferred{transition:none!important;}',
             '}'
         ].join('');
 
@@ -1244,30 +1261,6 @@
         } catch (e) {
             console.log('Plex Watchlist', 'native rows disable failed', e);
         }
-    }
-
-    function safeContentRow(loader) {
-        return function (call) {
-            var completed = false;
-            var timer = setTimeout(function () {
-                finish();
-            }, CONTENT_ROW_DEADLINE);
-
-            function finish(row) {
-                if (completed) return;
-
-                completed = true;
-                clearTimeout(timer);
-                call(row);
-            }
-
-            try {
-                loader(finish);
-            } catch (e) {
-                console.log('Plex Watchlist', 'content row failed', e);
-                finish();
-            }
-        };
     }
 
     function tokenFingerprint() {
@@ -1417,6 +1410,28 @@
         savePlexRowCache(rows);
     }
 
+    function savePlexRowFailureSnapshot(name) {
+        var rows = getPlexRowCache();
+        var key = scopedPlexRowKey(name);
+        var current = rows[key];
+
+        if (current && Array.isArray(current.cards) && current.cards.length) return;
+
+        rows[key] = {
+            time: Date.now(),
+            cards: [],
+            empty: true,
+            failed: true,
+            data: {
+                page: 1,
+                total_pages: 1,
+                has_more: false
+            }
+        };
+        prunePlexRowCache(rows);
+        savePlexRowCache(rows);
+    }
+
     function plexRowSnapshot(name) {
         var rows = getPlexRowCache();
         var key = scopedPlexRowKey(name);
@@ -1427,7 +1442,7 @@
         if (!row || !Array.isArray(row.cards) || !row.time) return null;
 
         age = Date.now() - row.time;
-        maxAge = row.empty ? PLEX_EMPTY_ROW_CACHE_TTL : PLEX_ROW_CACHE_MAX_AGE;
+        maxAge = PLEX_ROW_CACHE_MAX_AGE;
 
         if (age > maxAge) {
             delete rows[key];
@@ -1437,6 +1452,7 @@
 
         return {
             age: age,
+            empty: !!row.empty,
             cards: restorePlexRowCards(row.cards),
             data: row.data || {
                 page: 1,
@@ -1499,6 +1515,10 @@
             if (settled) return;
 
             settled = true;
+            if (plexRowLoading[scoped] === pending && scoped == scopedPlexRowKey(name) &&
+                pending.generation == (plexRowGenerations[scoped] || 0)) {
+                savePlexRowFailureSnapshot(name);
+            }
             finishPlexRowLoad(scoped, pending, false);
         }
 
@@ -1524,17 +1544,386 @@
         }, PLEX_ROW_REFRESH_DELAY);
     }
 
-    function loadCachedPlexRow(name, loader, success, fail) {
-        var cached = plexRowSnapshot(name);
+    function findDeferredPlexPage(params) {
+        var found = null;
 
-        if (cached) {
-            success(cached.cards, cached.data);
+        plexDeferredPages.forEach(function (page) {
+            if (!found && page.params === params) found = page;
+        });
 
-            if (cached.age >= PLEX_ROW_CACHE_TTL) schedulePlexRowRefresh(name, loader);
+        return found;
+    }
+
+    function getDeferredPlexPage(params) {
+        var page = findDeferredPlexPage(params);
+
+        if (page) return page;
+
+        page = {
+            params: params,
+            component: null,
+            bound: false,
+            built: false,
+            empty: false,
+            destroyed: false,
+            rows: [],
+            flush_timer: null,
+            original_start: null
+        };
+        plexDeferredPages.push(page);
+
+        return page;
+    }
+
+    function destroyDeferredPlexPage(page) {
+        var index;
+
+        if (!page || page.destroyed) return;
+
+        page.destroyed = true;
+        clearTimeout(page.flush_timer);
+
+        page.rows.forEach(function (row) {
+            clearTimeout(row.timer);
+        });
+
+        index = plexDeferredPages.indexOf(page);
+        if (index >= 0) plexDeferredPages.splice(index, 1);
+    }
+
+    function markDeferredPlexPageBuilt(page) {
+        if (!page || page.destroyed) return;
+
+        page.built = true;
+        clearTimeout(page.flush_timer);
+        page.flush_timer = setTimeout(function () {
+            page.flush_timer = null;
+            flushDeferredPlexPage(page);
+        }, PLEX_DEFERRED_ROW_DELAY);
+    }
+
+    function bindDeferredPlexPage(page) {
+        var activity;
+        var component;
+        var oldLinesBuild;
+        var oldDestroy;
+
+        if (!page || page.bound || page.destroyed) return;
+
+        activity = page.params && page.params.activity;
+        component = activity && activity.component;
+        if (!component) return;
+
+        page.component = component;
+        page.bound = true;
+        page.original_start = component.start;
+
+        if (typeof component.use == 'function') {
+            component.use({
+                onBuild: function () {
+                    markDeferredPlexPageBuilt(page);
+                },
+                onEmpty: function () {
+                    page.empty = true;
+                    markDeferredPlexPageBuilt(page);
+                },
+                onDestroy: function () {
+                    destroyDeferredPlexPage(page);
+                }
+            });
+
+            if (component.items && component.items.length) markDeferredPlexPageBuilt(page);
             return;
         }
 
-        fetchPlexRow(name, loader, success, fail);
+        if (typeof component.build == 'function') {
+            oldLinesBuild = component.onLinesBuild;
+            component.onLinesBuild = function () {
+                if (typeof oldLinesBuild == 'function') oldLinesBuild.apply(this, arguments);
+                markDeferredPlexPageBuilt(page);
+            };
+        }
+
+        if (typeof component.destroy == 'function') {
+            oldDestroy = component.destroy;
+            component.destroy = function () {
+                destroyDeferredPlexPage(page);
+                return oldDestroy.apply(this, arguments);
+            };
+        }
+    }
+
+    function deferredPlexRowAnimation(element) {
+        var enabled = storageGet('animation', true);
+
+        if (!element || !element.classList) return;
+
+        element.classList.add('plex-row-deferred');
+
+        if (enabled === false || enabled === 'false') {
+            element.classList.add('plex-row-deferred--instant');
+            element.classList.add('plex-row-deferred--visible');
+            return;
+        }
+
+        if (window.requestAnimationFrame) {
+            window.requestAnimationFrame(function () {
+                window.requestAnimationFrame(function () {
+                    element.classList.add('plex-row-deferred--visible');
+                });
+            });
+        } else {
+            setTimeout(function () {
+                element.classList.add('plex-row-deferred--visible');
+            }, 30);
+        }
+    }
+
+    function decorateDeferredPlexRow(row) {
+        var existing;
+        var oldCreate;
+        var emit = {};
+        var key;
+
+        if (!row) return row;
+
+        row.params = row.params || {};
+        existing = row.params.emit || {};
+        if (existing.plexDeferredDecorated) return row;
+
+        oldCreate = existing.onCreate;
+
+        for (key in existing) {
+            if (existing.hasOwnProperty(key)) emit[key] = existing[key];
+        }
+
+        emit.onCreate = function () {
+            if (typeof oldCreate == 'function') oldCreate.apply(this, arguments);
+            deferredPlexRowAnimation(domElement(this.html));
+        };
+        emit.plexDeferredDecorated = true;
+        row.params.emit = emit;
+
+        return row;
+    }
+
+    function orderDeferredPlexRows(component) {
+        var current;
+        var regular = [];
+        var deferred = [];
+        var activeItem;
+        var ordered;
+        var changed = false;
+
+        if (!component || !Array.isArray(component.items) || !component.scroll) return;
+
+        current = component.items.slice();
+        activeItem = current[component.active];
+
+        current.forEach(function (item) {
+            if (item && item.data && typeof item.data.plex_deferred_order == 'number') deferred.push(item);
+            else regular.push(item);
+        });
+
+        if (deferred.length < 2) return;
+
+        deferred.sort(function (a, b) {
+            return a.data.plex_deferred_order - b.data.plex_deferred_order ||
+                a.data.plex_deferred_sequence - b.data.plex_deferred_sequence;
+        });
+        // Keep cold rows at the bottom so late content never shifts the page under the user.
+        ordered = regular.concat(deferred);
+
+        ordered.forEach(function (item, index) {
+            if (item !== current[index]) changed = true;
+        });
+
+        if (!changed) return;
+
+        component.items = ordered;
+        if (activeItem) component.active = Math.max(0, ordered.indexOf(activeItem));
+
+        deferred.forEach(function (item) {
+            if (item && typeof item.render == 'function') component.scroll.append(item.render(true));
+        });
+    }
+
+    function appendDeferredPlexRow(page, pending, row) {
+        var component;
+        var modern;
+        var scrollElement;
+        var wasEmpty;
+
+        if (!page || page.destroyed || !page.built || !pending || pending.appended || !row) return;
+
+        component = page.component;
+        if (!component) return;
+
+        modern = typeof component.emit == 'function' && component.scroll &&
+            typeof component.scroll.append == 'function' && typeof component.scroll.render == 'function' &&
+            Array.isArray(component.items) &&
+            typeof document.createDocumentFragment == 'function';
+        if (!modern && typeof component.append != 'function') return;
+
+        pending.appended = true;
+        row.plex_deferred_order = pending.order;
+        row.plex_deferred_sequence = pending.sequence;
+        decorateDeferredPlexRow(row);
+        wasEmpty = page.empty;
+
+        try {
+            if (wasEmpty) {
+                if (component.empty_class && typeof component.empty_class.destroy == 'function') component.empty_class.destroy();
+                if (page.original_start) component.start = page.original_start;
+                if (component.scroll && typeof component.scroll.render == 'function') {
+                    scrollElement = domElement(component.scroll.render(true));
+
+                    if (scrollElement && scrollElement.classList) scrollElement.classList.remove('scroll--nopadding');
+                }
+                page.empty = false;
+            }
+
+            if (modern) {
+                // Create exactly one line without replaying every page-level onBuild handler.
+                component.fragment = document.createDocumentFragment();
+                component.emit('createAndAppend', row);
+                component.scroll.append(component.fragment);
+                orderDeferredPlexRows(component);
+
+                if (Lampa.Layer && typeof Lampa.Layer.visible == 'function') {
+                    Lampa.Layer.visible(component.scroll.render(true));
+                }
+            } else component.append(row);
+
+            if (wasEmpty && Lampa.Activity && typeof Lampa.Activity.own == 'function' &&
+                Lampa.Activity.own(component) && typeof component.start == 'function') {
+                component.start();
+            }
+
+            schedulePlexMarkerScan();
+        } catch (e) {
+            pending.appended = false;
+            console.log('Plex Watchlist', 'deferred row append failed', e);
+        }
+    }
+
+    function startDeferredPlexRow(page, pending) {
+        if (!page || page.destroyed || !pending || pending.finished) return;
+        if (pending.scope != tokenFingerprint()) {
+            pending.finished = true;
+            return;
+        }
+
+        pending.timer = null;
+
+        fetchPlexRow(pending.name, pending.loader, function (cards, data) {
+            var row;
+
+            pending.finished = true;
+            if (page.destroyed || pending.scope != tokenFingerprint()) return;
+
+            try {
+                row = pending.make(cards, data);
+            } catch (e) {
+                console.log('Plex Watchlist', 'deferred row build failed', e);
+                return;
+            }
+
+            appendDeferredPlexRow(page, pending, row);
+        }, function () {
+            pending.finished = true;
+        });
+    }
+
+    function flushDeferredPlexPage(page) {
+        var delay = 0;
+
+        if (!page || page.destroyed || !page.built) return;
+
+        page.rows.forEach(function (pending) {
+            if (pending.started || pending.finished || pending.appended) return;
+
+            pending.started = true;
+            pending.timer = setTimeout(function () {
+                startDeferredPlexRow(page, pending);
+            }, delay);
+            delay += PLEX_DEFERRED_ROW_STAGGER;
+        });
+    }
+
+    function queueDeferredPlexRow(params, name, loader, make, order) {
+        var page = getDeferredPlexPage(params);
+        var scoped = scopedPlexRowKey(name);
+        var exists = false;
+
+        page.rows.forEach(function (pending) {
+            if (pending.scoped == scoped) exists = true;
+        });
+
+        if (exists) return;
+
+        page.rows.push({
+            name: name,
+            scoped: scoped,
+            scope: tokenFingerprint(),
+            loader: loader,
+            make: make,
+            order: typeof order == 'number' ? order : page.rows.length,
+            sequence: page.rows.length,
+            started: false,
+            finished: false,
+            appended: false,
+            timer: null
+        });
+
+        bindDeferredPlexPage(page);
+        if (page.built) markDeferredPlexPageBuilt(page);
+    }
+
+    function progressivePlexContentRow(params, name, loader, make, order) {
+        return function (call) {
+            var cached;
+            var empty;
+            var row;
+            var released = false;
+
+            function release(value) {
+                if (released) return;
+
+                released = true;
+                call(value);
+            }
+
+            try {
+                cached = plexRowSnapshot(name);
+                empty = cached && (cached.empty || !cached.cards.length);
+
+                if (cached && !empty) {
+                    try {
+                        row = make(cached.cards, cached.data);
+                    } catch (e) {
+                        console.log('Plex Watchlist', 'cached row build failed', e);
+                    }
+
+                    release(row);
+
+                    if (cached.age >= PLEX_ROW_CACHE_TTL) schedulePlexRowRefresh(name, loader);
+                    return;
+                }
+
+                if (cached && cached.age < PLEX_EMPTY_ROW_CACHE_TTL) {
+                    release();
+                    return;
+                }
+
+                // Bind only local lifecycle hooks, then release Lampa before any Plex work starts.
+                queueDeferredPlexRow(params, name, loader, make, order);
+                release();
+            } catch (e) {
+                console.log('Plex Watchlist', 'progressive row failed', e);
+                release();
+            }
+        };
     }
 
     function cancelPlexRowWork(groups) {
@@ -1610,16 +1999,12 @@
             title: 'История',
             index: 2,
             screen: ['main'],
-            call: function () {
+            call: function (params) {
                 if (!token()) return;
 
-                return safeContentRow(function (call) {
-                    loadCachedPlexRow('main:history:episode_stills:blur', loadPlexHistory, function (cards, data) {
-                        call(makePlexRow('История', cards, historyRowOptions('all', 'История', data)));
-                    }, function () {
-                        call();
-                    });
-                });
+                return progressivePlexContentRow(params, 'main:history:episode_stills:blur', loadPlexHistory, function (cards, data) {
+                    return makePlexRow('История', cards, historyRowOptions('all', 'История', data));
+                }, 2);
             }
         });
 
@@ -1628,16 +2013,12 @@
             title: WATCHLIST_TITLE,
             index: 1,
             screen: ['main'],
-            call: function () {
+            call: function (params) {
                 if (!token()) return;
 
-                return safeContentRow(function (call) {
-                    loadCachedPlexRow('main:watchlist', loadPlexWatchlistRow, function (cards, data) {
-                        call(makePlexRow(WATCHLIST_TITLE, cards, watchlistRowOptions('all', WATCHLIST_TITLE, data)));
-                    }, function () {
-                        call();
-                    });
-                });
+                return progressivePlexContentRow(params, 'main:watchlist', loadPlexWatchlistRow, function (cards, data) {
+                    return makePlexRow(WATCHLIST_TITLE, cards, watchlistRowOptions('all', WATCHLIST_TITLE, data));
+                }, 1);
             }
         });
 
@@ -1649,13 +2030,9 @@
             call: function (params) {
                 if (!token() || params.url != 'movie') return;
 
-                return safeContentRow(function (call) {
-                    loadCachedPlexRow('category:movie:history', loadPlexMovieHistory, function (cards, data) {
-                        call(makePlexRow('Вы смотрели', cards, historyRowOptions('movie', 'Вы смотрели', data)));
-                    }, function () {
-                        call();
-                    });
-                });
+                return progressivePlexContentRow(params, 'category:movie:history', loadPlexMovieHistory, function (cards, data) {
+                    return makePlexRow('Вы смотрели', cards, historyRowOptions('movie', 'Вы смотрели', data));
+                }, 2);
             }
         });
 
@@ -1667,15 +2044,11 @@
             call: function (params) {
                 if (!token() || params.url != 'movie') return;
 
-                return safeContentRow(function (call) {
-                    loadCachedPlexRow('category:movie:watchlist', function (success, fail) {
-                        loadPlexWatchlistTypeRow('movie', success, fail);
-                    }, function (cards, data) {
-                        call(makePlexRow(WATCHLIST_TITLE, cards, watchlistRowOptions('movie', WATCHLIST_TITLE, data)));
-                    }, function () {
-                        call();
-                    });
-                });
+                return progressivePlexContentRow(params, 'category:movie:watchlist', function (success, fail) {
+                    loadPlexWatchlistTypeRow('movie', success, fail);
+                }, function (cards, data) {
+                    return makePlexRow(WATCHLIST_TITLE, cards, watchlistRowOptions('movie', WATCHLIST_TITLE, data));
+                }, 1);
             }
         });
 
@@ -1690,15 +2063,11 @@
                 if (!token() || (params.url != 'tv' && params.url != 'anime')) return;
                 kind = params.url == 'anime' ? 'anime' : 'tv';
 
-                return safeContentRow(function (call) {
-                    loadCachedPlexRow('category:' + kind + ':history:filled', function (success, fail) {
-                        loadPlexCategoryHistory(kind, success, fail);
-                    }, function (cards, data) {
-                        call(makePlexRow('Вы смотрели', cards, historyRowOptions(kind, 'Вы смотрели', data)));
-                    }, function () {
-                        call();
-                    });
-                });
+                return progressivePlexContentRow(params, 'category:' + kind + ':history:filled', function (success, fail) {
+                    loadPlexCategoryHistory(kind, success, fail);
+                }, function (cards, data) {
+                    return makePlexRow('Вы смотрели', cards, historyRowOptions(kind, 'Вы смотрели', data));
+                }, 2);
             }
         });
 
@@ -1713,15 +2082,11 @@
                 if (!token() || (params.url != 'tv' && params.url != 'anime')) return;
                 kind = params.url == 'anime' ? 'anime' : 'tv';
 
-                return safeContentRow(function (call) {
-                    loadCachedPlexRow('category:' + kind + ':watchlist:filled', function (success, fail) {
-                        loadPlexWatchlistTypeRow(kind, success, fail);
-                    }, function (cards, data) {
-                        call(makePlexRow(WATCHLIST_TITLE, cards, watchlistRowOptions(kind, WATCHLIST_TITLE, data)));
-                    }, function () {
-                        call();
-                    });
-                });
+                return progressivePlexContentRow(params, 'category:' + kind + ':watchlist:filled', function (success, fail) {
+                    loadPlexWatchlistTypeRow(kind, success, fail);
+                }, function (cards, data) {
+                    return makePlexRow(WATCHLIST_TITLE, cards, watchlistRowOptions(kind, WATCHLIST_TITLE, data));
+                }, 0);
             }
         });
 
@@ -1738,15 +2103,11 @@
                 if (screen == 'category' && params.url && params.url != 'tv' && params.url != 'anime') return;
                 kind = params.url == 'anime' ? 'anime' : 'tv';
 
-                return safeContentRow(function (call) {
-                    loadCachedPlexRow('category:' + kind + ':recent_episodes', function (success, fail) {
-                        loadPlexRecentlyAired(kind, success, fail);
-                    }, function (cards) {
-                        call(makePlexRow('Новые эпизоды', cards));
-                    }, function () {
-                        call();
-                    });
-                });
+                return progressivePlexContentRow(params, 'category:' + kind + ':recent_episodes', function (success, fail) {
+                    loadPlexRecentlyAired(kind, success, fail);
+                }, function (cards) {
+                    return makePlexRow('Новые эпизоды', cards);
+                }, 1);
             }
         });
     }
@@ -5339,6 +5700,7 @@
 
     function clearPlexCaches() {
         cancelPlexRowWork();
+        plexDeferredPages.slice().forEach(destroyDeferredPlexPage);
         watchedSnapshotGeneration++;
         lampaFullCardGeneration++;
         cancelLampaFullCardRequests();
