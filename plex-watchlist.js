@@ -2,7 +2,7 @@
     'use strict';
 
     var PLUGIN_ID = 'plex_watchlist';
-    var VERSION = '0.5.16';
+    var VERSION = '0.5.17';
     var WATCHLIST_TITLE = 'Очередь';
     var WATCHLIST_FROM_TITLE = 'Очереди';
     var PLEX = 'https://plex.tv';
@@ -1614,7 +1614,7 @@
                 if (!token()) return;
 
                 return safeContentRow(function (call) {
-                    loadCachedPlexRow('main:history:episode_stills', loadPlexHistory, function (cards, data) {
+                    loadCachedPlexRow('main:history:episode_stills:blur', loadPlexHistory, function (cards, data) {
                         call(makePlexRow('История', cards, historyRowOptions('all', 'История', data)));
                     }, function () {
                         call();
@@ -3014,6 +3014,7 @@
         var existing = card.params.emit || {};
         if (existing.plexWatchlistDecorated) return card;
 
+        var oldInit = existing.onInit;
         var oldCreate = existing.onCreate;
         var emit = {};
 
@@ -3021,6 +3022,10 @@
             if (existing.hasOwnProperty(key)) emit[key] = existing[key];
         }
 
+        emit.onInit = function (instance) {
+            if (typeof oldInit == 'function') oldInit.apply(this, arguments);
+            useHistoryEpisodePoster(instance, card);
+        };
         emit.onCreate = function () {
             if (typeof oldCreate == 'function') oldCreate.apply(this, arguments);
             decorateCreatedCard(this.html, this.data || card);
@@ -3030,6 +3035,19 @@
         card.params.emit = emit;
 
         return card;
+    }
+
+    function useHistoryEpisodePoster(instance, fallbackCard) {
+        var card = instance && instance.data || fallbackCard || {};
+        var image = card.plex_episode_thumb || fallbackCard && fallbackCard.plex_episode_thumb || '';
+
+        if (!instance || !image) return;
+        if (card.plex_row_kind != 'history' || !card.plex_episode_rating_key) return;
+
+        // Lampa also uses poster/img as the focus background, so replace only the rendered card image.
+        instance.getPosterPath = function () {
+            return image;
+        };
     }
 
     function domElement(node) {
@@ -4337,12 +4355,6 @@
             if (source.background_image) target.background_image = source.background_image;
         }
 
-        if (episodeThumb && source.plex_row_kind == 'history' && source.plex_episode_rating_key) {
-            delete target.poster_path;
-            target.poster = episodeThumb;
-            target.img = episodeThumb;
-        }
-
         target.plex_rating_key = source.plex_rating_key;
         target.plex_episode_rating_key = source.plex_episode_rating_key || '';
         target.plex_episode_season = source.plex_episode_season || '';
@@ -5055,7 +5067,7 @@
         var year = isEpisode ? episodeSeriesYear(item) : item.grandparentYear || metadataYear(item);
         var episodeYear = isEpisode ? ((episodeAirDate(item) || '').match(/\d{4}/) || [''])[0] : '';
         var episodeThumb = isEpisode ? episodeStillImage(item) : '';
-        var thumb = isEpisode ? (rowKind == 'history' ? episodeThumb : '') || item.grandparentThumb || item.parentThumb || item.thumb : item.thumb;
+        var thumb = isEpisode ? item.grandparentThumb || item.parentThumb || item.thumb : item.thumb;
         var art = isEpisode ? item.grandparentArt || item.parentArt || item.art : item.art;
 
         if (isEpisode && episodeYear && year == episodeYear && !episodeSeriesYear(item)) year = '';
@@ -5071,6 +5083,7 @@
             plex_art: art,
             plex_guid: guid,
             plex_rating_key: ratingKey || item.ratingKey,
+            plex_row_kind: rowKind || '',
             plex_title: title,
             source: 'tmdb',
             year: year,
