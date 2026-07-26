@@ -2,7 +2,7 @@
     'use strict';
 
     var PLUGIN_ID = 'plex_watchlist';
-    var VERSION = '0.5.20';
+    var VERSION = '0.5.22';
     var WATCHLIST_TITLE = 'Очередь';
     var WATCHLIST_FROM_TITLE = 'Очереди';
     var PLEX = 'https://plex.tv';
@@ -13,11 +13,11 @@
     var WATCHLIST_PATH = '/library/sections/watchlist/all';
     var CACHE_KEY = 'plex_watchlist_cache';
     var LEGACY_ROW_CACHE_KEY = 'plex_watchlist_rows_cache';
-    var ROW_CACHE_KEY = 'plex_watchlist_rows_cache_v3';
+    var ROW_CACHE_KEY = 'plex_watchlist_rows_cache_v4';
     var LAMPA_FULL_CARD_CACHE_KEY = 'plex_watchlist_lampa_full_cards';
     var LAMPA_FULL_CARD_CACHE_SCHEMA = 1;
-    var LAMPA_MATCH_CACHE_SCHEMA = 2;
-    var CACHE_SCHEMA = 8;
+    var LAMPA_MATCH_CACHE_SCHEMA = 3;
+    var CACHE_SCHEMA = 9;
     var CLIENT_ID_KEY = 'plex_watchlist_client_id';
     var PAGE_SIZE = 20;
     var PLEX_ROW_SIZE = 24;
@@ -35,7 +35,6 @@
     var PLEX_ROW_CACHE_TTL = 5 * 60 * 1000;
     var PLEX_ROW_CACHE_MAX_AGE = 7 * 24 * 60 * 60 * 1000;
     var PLEX_EMPTY_ROW_CACHE_TTL = 60 * 1000;
-    var PLEX_ROW_REFRESH_DELAY = 8 * 1000;
     var PLEX_MARKER_SCAN_INTERVAL = 10 * 1000;
     var PLEX_DEFERRED_ROW_DELAY = 180;
     var PLEX_DEFERRED_ROW_STAGGER = 240;
@@ -76,7 +75,6 @@
     var watchedSnapshotTimer = null;
     var watchedSnapshotGeneration = 0;
     var plexRowLoading = {};
-    var plexRowRefreshTimers = {};
     var plexRowGenerations = {};
     var plexDeferredPages = [];
     var lampaFullCardCacheMemory = null;
@@ -85,6 +83,8 @@
     var lampaFullCardRequests = {};
     var lampaFullCardActive = 0;
     var lampaFullCardGeneration = 0;
+    var plexMetadataDetailCache = {};
+    var plexMetadataDetailRequests = {};
     var HISTORY_ROUTE = PLUGIN_ID + '_history';
 
     function startPlugin() {
@@ -702,6 +702,10 @@
         }).join(' ');
     }
 
+    function titleWithoutTrailingYear(value) {
+        return (value || '').toString().replace(/\s*[\(\[]?(?:19|20)\d{2}[\)\]]?\s*$/, '').trim();
+    }
+
     function normalizedTitleList(list) {
         var out = [];
         var seen = {};
@@ -718,16 +722,12 @@
         list.forEach(function (title) {
             var normalized = normalizeTitle(title);
             var leet = normalizeTitleLeet(title);
+            var withoutYear = titleWithoutTrailingYear(title);
 
             add(normalized);
             add(leet);
-
-            if (normalized == 'seven' || normalized == 'se7en' || normalized == 'семь' ||
-                leet == 'seven' || leet == 'семь') {
-                add('seven');
-                add('se7en');
-                add('семь');
-            }
+            add(withoutYear);
+            add(normalizeTitleLeet(withoutYear));
         });
 
         return out;
@@ -749,6 +749,12 @@
         item = item || {};
 
         return item.year || yearFromText(item.originallyAvailableAt) || yearFromText(item.publishedAt) || yearFromText(item.publicPagesURL) || yearFromText(item.slug) || yearFromText(item.key) || yearFromText(item.sourceURI) || '';
+    }
+
+    function metadataOriginalTitle(item) {
+        item = item || {};
+
+        return item.originalTitle || item.original_title || item.originalName || item.original_name || '';
     }
 
     function episodeSeriesYear(item) {
@@ -1560,20 +1566,6 @@
         }
     }
 
-    function schedulePlexRowRefresh(name, loader) {
-        var scoped = scopedPlexRowKey(name);
-
-        if (plexRowRefreshTimers[scoped] || plexRowLoading[scoped]) return;
-
-        plexRowRefreshTimers[scoped] = setTimeout(function () {
-            delete plexRowRefreshTimers[scoped];
-
-            if (scoped != scopedPlexRowKey(name)) return;
-
-            fetchPlexRow(name, loader);
-        }, PLEX_ROW_REFRESH_DELAY);
-    }
-
     function findDeferredPlexPage(params) {
         var found = null;
 
@@ -1615,6 +1607,7 @@
 
         page.rows.forEach(function (row) {
             clearTimeout(row.timer);
+            clearTimeout(row.replace_timer);
         });
 
         index = plexDeferredPages.indexOf(page);
@@ -1737,6 +1730,300 @@
         return row;
     }
 
+    function tagPlexRow(name, row) {
+        if (row) row.plex_row_scope = scopedPlexRowKey(name);
+
+        return row;
+    }
+
+    function plexRowCardIdentity(card) {
+        card = card || {};
+
+        return [
+            card.plex_episode_rating_key || '',
+            card.plex_rating_key || '',
+            card.tmdb_id || card.id || '',
+            card.plex_episode_label || '',
+            cardTitle(card)
+        ].join(':');
+    }
+
+    function plexRowFingerprint(row) {
+        return JSON.stringify({
+            page: row && row.page || 1,
+            total_pages: row && row.total_pages || 1,
+            cards: asArray(row && row.results).map(function (card) {
+                return [
+                    plexRowCardIdentity(card),
+                    card.poster_path || card.poster || card.img || '',
+                    card.backdrop_path || card.background_image || '',
+                    card.plex_episode_thumb || '',
+                    card.plex_watched ? 1 : 0,
+                    card.plex_rating || 0
+                ];
+            })
+        });
+    }
+
+    function bindCachedPlexRow(pending, row) {
+        var existing;
+        var oldInit;
+        var oldDestroy;
+        var emit = {};
+        var key;
+
+        if (!pending || !row) return row;
+
+        row.params = row.params || {};
+        existing = row.params.emit || {};
+        oldInit = existing.onInit;
+        oldDestroy = existing.onDestroy;
+
+        for (key in existing) {
+            if (existing.hasOwnProperty(key)) emit[key] = existing[key];
+        }
+
+        emit.onInit = function (instance) {
+            if (typeof oldInit == 'function') oldInit.apply(this, arguments);
+            pending.line = instance;
+        };
+        emit.onDestroy = function () {
+            if (pending.line === this) pending.line = null;
+            if (typeof oldDestroy == 'function') oldDestroy.apply(this, arguments);
+        };
+        row.params.emit = emit;
+
+        return row;
+    }
+
+    function syncPlexRowMeta(target, fresh) {
+        ['page', 'total_pages', 'has_more', 'onMore'].forEach(function (name) {
+            if (fresh && fresh[name] !== undefined) target[name] = fresh[name];
+            else if (target && target[name] !== undefined) delete target[name];
+        });
+    }
+
+    function findPlexRowCardIndex(cards, identity, fallback) {
+        var found = -1;
+
+        if (identity) {
+            asArray(cards).some(function (card, index) {
+                if (plexRowCardIdentity(card) != identity) return false;
+
+                found = index;
+                return true;
+            });
+        }
+
+        if (found >= 0) return found;
+        if (!cards || !cards.length) return -1;
+
+        return Math.max(0, Math.min(parseInt(fallback || 0, 10) || 0, cards.length - 1));
+    }
+
+    function plexActivityOwnsComponent(component) {
+        if (!Lampa.Activity || typeof Lampa.Activity.own != 'function') return true;
+
+        return Lampa.Activity.own(component);
+    }
+
+    function plexControllerAllowsLineChange() {
+        var current;
+        var name;
+
+        if (!Lampa.Controller || typeof Lampa.Controller.enabled != 'function') return false;
+
+        current = Lampa.Controller.enabled();
+        name = current && current.name || '';
+
+        return name == 'content' || name == 'head' || name == 'menu';
+    }
+
+    function removeCachedPlexRow(page, pending) {
+        var component = page && page.component;
+        var oldLine = pending && pending.line;
+        var oldIndex;
+        var parentActiveItem;
+
+        if (!page || page.destroyed || !pending || pending.scope != tokenFingerprint()) return;
+        if (!component || !Array.isArray(component.items) || !oldLine || typeof oldLine.render != 'function') return;
+
+        oldIndex = component.items.indexOf(oldLine);
+        if (oldIndex < 0) return;
+
+        parentActiveItem = component.items[component.active];
+
+        if ((Lampa.Controller && typeof Lampa.Controller.own == 'function' && Lampa.Controller.own(oldLine)) ||
+            (parentActiveItem === oldLine && plexActivityOwnsComponent(component) &&
+                !plexControllerAllowsLineChange())) {
+            clearTimeout(pending.replace_timer);
+            pending.replace_timer = setTimeout(function () {
+                pending.replace_timer = null;
+                removeCachedPlexRow(page, pending);
+            }, 250);
+            return;
+        }
+
+        component.items.splice(oldIndex, 1);
+
+        if (parentActiveItem === oldLine) {
+            component.active = Math.max(0, Math.min(oldIndex, component.items.length - 1));
+        } else if (parentActiveItem) {
+            component.active = Math.max(0, component.items.indexOf(parentActiveItem));
+        }
+
+        pending.current_row = null;
+        pending.line = null;
+
+        if (typeof oldLine.destroy == 'function') oldLine.destroy();
+
+        if (!component.items.length && typeof component.empty == 'function') {
+            page.empty = true;
+            component.empty();
+            schedulePlexMarkerScan();
+            return;
+        }
+
+        if (Lampa.Layer && typeof Lampa.Layer.visible == 'function' && component.scroll &&
+            typeof component.scroll.render == 'function') {
+            Lampa.Layer.visible(component.scroll.render(true));
+        }
+
+        schedulePlexMarkerScan();
+    }
+
+    function replaceCachedPlexRow(page, pending, freshRow) {
+        var component = page && page.component;
+        var oldLine = pending && pending.line;
+        var oldIndex;
+        var oldItem;
+        var oldIdentity;
+        var oldCardIndex;
+        var oldWasMore;
+        var targetIndex;
+        var targetItem;
+        var targetElement;
+        var parentActiveItem;
+        var wasControlled;
+        var activityOwnsComponent;
+        var previousFragment;
+        var scratch;
+        var nextLine;
+        var nextIndex;
+        var oldRoot;
+        var nextRoot;
+
+        if (!page || page.destroyed || !pending || !freshRow || !freshRow.results || !freshRow.results.length) return;
+        if (!component || typeof component.emit != 'function' || !Array.isArray(component.items) ||
+            typeof document.createDocumentFragment != 'function') return;
+        if (!oldLine || !oldLine.data || !oldLine.scroll || typeof oldLine.render != 'function') return;
+
+        oldIndex = component.items.indexOf(oldLine);
+        if (oldIndex < 0) return;
+
+        if (plexRowFingerprint(oldLine.data) == plexRowFingerprint(freshRow)) {
+            syncPlexRowMeta(oldLine.data, freshRow);
+            pending.current_row = freshRow;
+            return;
+        }
+
+        oldCardIndex = Math.max(0, parseInt(oldLine.active || 0, 10) || 0);
+        oldItem = oldLine.items && oldLine.items[oldCardIndex];
+        oldWasMore = !!(oldLine.more && oldItem === oldLine.more);
+        oldIdentity = oldItem && oldItem.data ? plexRowCardIdentity(oldItem.data) : '';
+        targetIndex = findPlexRowCardIndex(freshRow.results, oldIdentity, oldCardIndex);
+        parentActiveItem = component.items[component.active];
+        wasControlled = !!(Lampa.Controller && typeof Lampa.Controller.own == 'function' && Lampa.Controller.own(oldLine));
+        activityOwnsComponent = plexActivityOwnsComponent(component);
+
+        if (parentActiveItem === oldLine && activityOwnsComponent && !wasControlled &&
+            !plexControllerAllowsLineChange()) {
+            clearTimeout(pending.replace_timer);
+            pending.replace_timer = setTimeout(function () {
+                pending.replace_timer = null;
+                replaceCachedPlexRow(page, pending, freshRow);
+            }, 250);
+            return;
+        }
+
+        clearTimeout(pending.replace_timer);
+        pending.replace_timer = null;
+
+        previousFragment = component.fragment;
+        scratch = document.createDocumentFragment();
+        component.fragment = scratch;
+        bindCachedPlexRow(pending, freshRow);
+
+        try {
+            component.emit('createAndAppend', freshRow);
+        } catch (e) {
+            console.log('Plex Watchlist', 'cached row create failed', e);
+        }
+
+        component.fragment = previousFragment;
+        nextLine = pending.line;
+
+        if (!nextLine || nextLine === oldLine || typeof nextLine.render != 'function') {
+            pending.line = oldLine;
+            return;
+        }
+
+        nextIndex = component.items.indexOf(nextLine);
+        oldRoot = domElement(oldLine.render(true));
+        nextRoot = domElement(nextLine.render(true));
+
+        if (nextIndex < 0 || !oldRoot || !oldRoot.parentNode || !nextRoot) {
+            if (nextIndex >= 0) component.items.splice(nextIndex, 1);
+            if (typeof nextLine.destroy == 'function') nextLine.destroy();
+            pending.line = oldLine;
+            return;
+        }
+
+        if (oldWasMore) {
+            while (nextLine.items && nextLine.items.length < freshRow.results.length && typeof nextLine.emit == 'function') {
+                nextLine.emit('createAndAppend', freshRow.results[nextLine.items.length]);
+            }
+
+            if (typeof nextLine.emit == 'function') nextLine.emit('scroll');
+            targetIndex = nextLine.more ? nextLine.items.indexOf(nextLine.more) : Math.max(0, nextLine.items.length - 1);
+        } else {
+            while (nextLine.items && nextLine.items.length <= targetIndex &&
+                nextLine.items.length < freshRow.results.length && typeof nextLine.emit == 'function') {
+                nextLine.emit('createAndAppend', freshRow.results[nextLine.items.length]);
+            }
+        }
+
+        component.items.splice(nextIndex, 1);
+        component.items[oldIndex] = nextLine;
+
+        if (parentActiveItem === oldLine) component.active = oldIndex;
+        else if (parentActiveItem) component.active = Math.max(0, component.items.indexOf(parentActiveItem));
+
+        oldRoot.parentNode.replaceChild(nextRoot, oldRoot);
+        pending.line = nextLine;
+        pending.current_row = freshRow;
+
+        if (typeof oldLine.destroy == 'function') oldLine.destroy();
+
+        targetItem = nextLine.items && nextLine.items[targetIndex];
+        targetElement = targetItem && typeof targetItem.render == 'function' ? domElement(targetItem.render(true)) : null;
+
+        if (targetItem) {
+            nextLine.active = targetIndex;
+            nextLine.last = targetItem.render(true);
+
+            if (nextLine.scroll && typeof nextLine.scroll.immediate == 'function' && targetElement) {
+                nextLine.scroll.immediate(targetElement, nextLine.params && nextLine.params.items &&
+                    nextLine.params.items.align_left ? false : true);
+            }
+        }
+
+        if (wasControlled && typeof nextLine.toggle == 'function') nextLine.toggle();
+
+        if (Lampa.Layer && typeof Lampa.Layer.visible == 'function') Lampa.Layer.visible(nextRoot);
+        schedulePlexMarkerScan();
+    }
+
     function orderDeferredPlexRows(component) {
         var current;
         var regular = [];
@@ -1853,9 +2140,15 @@
             if (page.destroyed || pending.scope != tokenFingerprint()) return;
 
             try {
-                row = pending.make(cards, data);
+                row = tagPlexRow(pending.name, pending.make(cards, data));
             } catch (e) {
                 console.log('Plex Watchlist', 'deferred row build failed', e);
+                return;
+            }
+
+            if (pending.cached_row) {
+                if (!row && !asArray(cards).length) removeCachedPlexRow(page, pending);
+                else replaceCachedPlexRow(page, pending, row);
                 return;
             }
 
@@ -1881,18 +2174,19 @@
         });
     }
 
-    function queueDeferredPlexRow(params, name, loader, make, order) {
+    function queueDeferredPlexRow(params, name, loader, make, order, cachedRow) {
         var page = getDeferredPlexPage(params);
         var scoped = scopedPlexRowKey(name);
-        var exists = false;
+        var existing = null;
+        var pending;
 
-        page.rows.forEach(function (pending) {
-            if (pending.scoped == scoped) exists = true;
+        page.rows.forEach(function (item) {
+            if (item.scoped == scoped) existing = item;
         });
 
-        if (exists) return;
+        if (existing) return existing;
 
-        page.rows.push({
+        pending = {
             name: name,
             scoped: scoped,
             scope: tokenFingerprint(),
@@ -1903,19 +2197,33 @@
             started: false,
             finished: false,
             appended: false,
-            timer: null
-        });
+            timer: null,
+            cached_row: cachedRow || null,
+            current_row: cachedRow || null,
+            line: null,
+            replace_timer: null
+        };
+        page.rows.push(pending);
+
+        if (cachedRow) bindCachedPlexRow(pending, cachedRow);
 
         bindDeferredPlexPage(page);
         if (page.built) markDeferredPlexPageBuilt(page);
+
+        return pending;
     }
 
-    function progressivePlexContentRow(params, name, loader, make, order) {
+    function progressivePlexContentRow(params, name, loader, make, order, options) {
         return function (call) {
             var cached;
             var empty;
             var row;
+            var shouldRefresh;
+            var component;
+            var modern;
             var released = false;
+
+            options = options || {};
 
             function release(value) {
                 if (released) return;
@@ -1930,18 +2238,35 @@
 
                 if (cached && !empty) {
                     try {
-                        row = make(cached.cards, cached.data);
+                        row = tagPlexRow(name, make(cached.cards, cached.data));
                     } catch (e) {
                         console.log('Plex Watchlist', 'cached row build failed', e);
                     }
 
-                    release(row);
+                    shouldRefresh = !!options.revalidate || cached.age >= PLEX_ROW_CACHE_TTL;
 
-                    if (cached.age >= PLEX_ROW_CACHE_TTL) schedulePlexRowRefresh(name, loader);
+                    if (row && shouldRefresh) {
+                        component = params && params.activity && params.activity.component;
+                        modern = component && typeof component.emit == 'function' && Array.isArray(component.items);
+
+                        if (modern) {
+                            // Show the snapshot now, then replace only this line after Plex responds.
+                            queueDeferredPlexRow(params, name, loader, make, order, row);
+                            release(row);
+                        } else {
+                            // Legacy Line keeps its cards in closures, so only mount the fresh result.
+                            queueDeferredPlexRow(params, name, loader, make, order);
+                            release();
+                        }
+
+                        return;
+                    }
+
+                    release(row);
                     return;
                 }
 
-                if (cached && cached.age < PLEX_EMPTY_ROW_CACHE_TTL) {
+                if (cached && cached.age < PLEX_EMPTY_ROW_CACHE_TTL && !options.revalidate) {
                     release();
                     return;
                 }
@@ -1975,9 +2300,6 @@
             return matched;
         }
 
-        Object.keys(plexRowRefreshTimers).forEach(function (key) {
-            keys[key] = true;
-        });
         Object.keys(plexRowLoading).forEach(function (key) {
             keys[key] = true;
         });
@@ -1986,11 +2308,6 @@
             if (!matches(key)) return;
 
             plexRowGenerations[key] = (plexRowGenerations[key] || 0) + 1;
-
-            if (plexRowRefreshTimers[key]) {
-                clearTimeout(plexRowRefreshTimers[key]);
-                delete plexRowRefreshTimers[key];
-            }
 
             if (plexRowLoading[key]) finishPlexRowLoad(key, plexRowLoading[key], false);
         });
@@ -2034,7 +2351,9 @@
 
                 return progressivePlexContentRow(params, 'main:history:episode_stills:blur', loadPlexHistory, function (cards, data) {
                     return makePlexRow('История', cards, historyRowOptions('all', 'История', data));
-                }, 2);
+                }, 2, {
+                    revalidate: true
+                });
             }
         });
 
@@ -2744,6 +3063,7 @@
                 success(cards);
             }, {
                 enrichEpisodes: true,
+                enrichGuids: true,
                 watched: historyWatchedState
             });
             return;
@@ -2752,6 +3072,7 @@
         hydratePlexItems(items, kind == 'show' ? 'show_history' : 'history', function (cards) {
             success(cards);
         }, {
+            enrichGuids: true,
             watched: kind == 'movie' ? true : undefined
         });
     }
@@ -2890,6 +3211,7 @@
 
             hydratePlexItems(history, 'history', success, {
                 enrichEpisodes: true,
+                enrichGuids: true,
                 watched: historyWatchedState
             });
         }, fail);
@@ -2996,7 +3318,9 @@
                 return;
             }
 
-            hydratePlexItems(shows, 'show_history', success);
+            hydratePlexItems(shows, 'show_history', success, {
+                enrichGuids: true
+            });
         });
     }
 
@@ -3049,6 +3373,7 @@
             }
 
             hydratePlexItems(movies, 'history', success, {
+                enrichGuids: true,
                 watched: true
             });
         }, fail);
@@ -3159,7 +3484,14 @@
     function mergeEpisodeDetail(item, detail) {
         var merged = {};
         var fields = [
+            'guid',
+            'primaryGuid',
+            'originalTitle',
+            'original_title',
+            'originalName',
+            'original_name',
             'grandparentTitle',
+            'grandparentOriginalTitle',
             'grandparentRatingKey',
             'grandparentGuid',
             'grandparentGuidList',
@@ -3176,6 +3508,8 @@
             'originallyAvailableAt',
             'publishedAt',
             'year',
+            'thumb',
+            'art',
             'Guid',
             'UserState'
         ];
@@ -3199,6 +3533,53 @@
         return merged;
     }
 
+    function plexMetadataDetailKey(ratingKey) {
+        return tokenFingerprint() + ':' + ratingKey;
+    }
+
+    function loadPlexMetadataDetail(ratingKey, done) {
+        var key;
+
+        if (!ratingKey) {
+            done(null);
+            return;
+        }
+
+        key = plexMetadataDetailKey(ratingKey);
+
+        if (Object.prototype.hasOwnProperty.call(plexMetadataDetailCache, key)) {
+            done(plexMetadataDetailCache[key]);
+            return;
+        }
+
+        if (plexMetadataDetailRequests[key]) {
+            plexMetadataDetailRequests[key].push(done);
+            return;
+        }
+
+        plexMetadataDetailRequests[key] = [done];
+
+        function finish(detail, cacheable) {
+            var callbacks = plexMetadataDetailRequests[key] || [];
+
+            delete plexMetadataDetailRequests[key];
+            if (cacheable) plexMetadataDetailCache[key] = detail || null;
+
+            callbacks.forEach(function (callback) {
+                callback(detail || null);
+            });
+        }
+
+        request('GET', METADATA + '/library/metadata/' + encodeURIComponent(ratingKey), {
+            includeGuids: 1,
+            includeUserState: 1
+        }, function (data) {
+            finish(collectMetadata(data)[0] || null, true);
+        }, function () {
+            finish(null, false);
+        });
+    }
+
     function metadataGuidList(item) {
         var guids = [];
 
@@ -3213,13 +3594,33 @@
         return guids;
     }
 
+    function hasExternalMetadataGuid(item) {
+        var guids = metadataGuidList(item);
+
+        asArray(item && item.parentGuidList).forEach(function (guid) {
+            if (guid && guid.id) guids.push(guid.id);
+            else if (guid) guids.push(guid);
+        });
+        asArray(item && item.grandparentGuidList).forEach(function (guid) {
+            if (guid && guid.id) guids.push(guid.id);
+            else if (guid) guids.push(guid);
+        });
+        if (item && item.parentGuid) guids.push(item.parentGuid);
+        if (item && item.grandparentGuid) guids.push(item.grandparentGuid);
+        if (item && item.primaryGuid) guids.push(item.primaryGuid);
+
+        return guids.some(function (guid) {
+            return /^(?:tmdb|imdb):\/\//i.test(guid || '');
+        });
+    }
+
     function preferredGuid(item) {
         var guids = metadataGuidList(item);
         var best = '';
 
         guids.forEach(function (guid) {
             if (!best) best = guid;
-            if ((guid + '').indexOf('tmdb://') === 0) best = guid;
+            if (/^tmdb:\/\//i.test(guid || '')) best = guid;
         });
 
         return best;
@@ -3230,12 +3631,14 @@
         var showYear = metadataYear(show);
         var showGuid = preferredGuid(show);
         var showGuids = metadataGuidList(show);
+        var showOriginalTitle = metadataOriginalTitle(show);
 
         for (var key in item) {
             if (item.hasOwnProperty(key)) merged[key] = item[key];
         }
 
         if (show && show.title) merged.grandparentTitle = show.title;
+        if (showOriginalTitle) merged.grandparentOriginalTitle = showOriginalTitle;
         if (show && metadataRatingKey(show)) merged.grandparentRatingKey = metadataRatingKey(show);
         if (showGuid) merged.grandparentGuid = showGuid;
         if (showGuids.length) merged.grandparentGuidList = showGuids;
@@ -3255,11 +3658,7 @@
             return;
         }
 
-        request('GET', METADATA + '/library/metadata/' + encodeURIComponent(ratingKey), {
-            includeGuids: 1,
-            includeUserState: 1
-        }, function (data) {
-            var detail = collectMetadata(data)[0];
+        loadPlexMetadataDetail(ratingKey, function (detail) {
             var merged = detail ? mergeEpisodeDetail(item, detail) : item;
             var showKey = merged.grandparentRatingKey;
 
@@ -3268,18 +3667,22 @@
                 return;
             }
 
-            request('GET', METADATA + '/library/metadata/' + encodeURIComponent(showKey), {
-                includeGuids: 1,
-                includeUserState: 1
-            }, function (showData) {
-                var show = collectMetadata(showData)[0];
-
+            loadPlexMetadataDetail(showKey, function (show) {
                 done(show ? mergeEpisodeShowDetail(merged, show) : merged);
-            }, function () {
-                done(merged);
             });
-        }, function () {
+        });
+    }
+
+    function enrichMetadataIdentityItem(item, done) {
+        var ratingKey = metadataRatingKey(item);
+
+        if (!ratingKey || hasExternalMetadataGuid(item)) {
             done(item);
+            return;
+        }
+
+        loadPlexMetadataDetail(ratingKey, function (detail) {
+            done(detail ? mergeEpisodeDetail(item, detail) : item);
         });
     }
 
@@ -3290,7 +3693,7 @@
         var finished = 0;
         var completed = false;
 
-        if (!options.enrichEpisodes || !items.length) {
+        if ((!options.enrichEpisodes && !options.enrichGuids) || !items.length) {
             done(out);
             return;
         }
@@ -3312,7 +3715,12 @@
                 (function (index) {
                     active++;
 
-                    enrichEpisodeItem(items[index], function (item) {
+                    var prepare = options.enrichEpisodes && shouldEnrichEpisode(items[index]) ? enrichEpisodeItem :
+                        (options.enrichGuids ? enrichMetadataIdentityItem : function (item, callback) {
+                            callback(item);
+                        });
+
+                    prepare(items[index], function (item) {
                         out[index] = item || items[index];
                         active--;
                         finished++;
@@ -4761,7 +5169,11 @@
         target.plex_guid = source.plex_guid || '';
         target.plex_art = source.plex_art || '';
         target.plex_title = source.plex_title || source.title || source.name || '';
+        target.plex_original_title = source.plex_original_title || source.original_title || source.original_name || '';
         target.plex_tmdb_id = source.tmdb_id || (typeof source.id == 'number' ? source.id : '');
+        target.plex_imdb_id = source.imdb_id || source.plex_imdb_id || '';
+        if (!target.imdb_id && target.plex_imdb_id) target.imdb_id = target.plex_imdb_id;
+        if (!target.tmdb_id && target.plex_tmdb_id) target.tmdb_id = target.plex_tmdb_id;
         target.source = target.source || 'tmdb';
         applyPlexCardDecorations(target);
 
@@ -4842,6 +5254,7 @@
         var titles = [
             cardTitle(card),
             card.plex_title,
+            card.plex_original_title,
             card.original_title,
             card.original_name
         ];
@@ -4907,6 +5320,40 @@
         }
     }
 
+    function requestLampaImdbMatch(card, success, fail) {
+        var imdb = normalizedImdbId(card && (card.imdb_id || card.plex_imdb_id));
+        var api = Lampa.Api && Lampa.Api.sources && Lampa.Api.sources.tmdb;
+        var isShow = cardType(card) == 'show';
+
+        if (!api && Lampa.TMDB) api = Lampa.TMDB;
+
+        if (!imdb || !api || typeof api.get !== 'function') {
+            fail();
+            return;
+        }
+
+        try {
+            api.get('find/' + encodeURIComponent(imdb) + '?external_source=imdb_id', {}, function (data) {
+                var results = asArray(data && data[isShow ? 'tv_results' : 'movie_results']);
+                var found = results[0];
+
+                if (!found || !found.id) {
+                    fail();
+                    return;
+                }
+
+                found.source = 'tmdb';
+                found.tmdb_id = found.id;
+                found.imdb_id = imdb;
+                found.plex_lampa_type = isShow ? 'tv' : 'movie';
+                success(found);
+            }, fail);
+        } catch (e) {
+            console.log('Plex Watchlist', 'IMDb card lookup failed', e);
+            fail();
+        }
+    }
+
     function searchLampaCard(card, done) {
         var searches = lampaSearchParams(card);
         var index = 0;
@@ -4944,7 +5391,7 @@
             return;
         }
 
-        next();
+        requestLampaImdbMatch(card, finish, next);
     }
 
     function collectLampaSearchResults(data) {
@@ -4973,36 +5420,15 @@
         return out;
     }
 
-    function titleWordCount(title) {
-        return (title || '').split(' ').filter(function (part) {
-            return !!part;
-        }).length;
-    }
-
     function titleMatchScore(wanted, title) {
-        var wantedWords;
-        var titleWords;
-
         if (!wanted || !title) return 0;
-        if (title == wanted) return 70;
-
-        if (title.indexOf(wanted) >= 0 || wanted.indexOf(title) >= 0) {
-            wantedWords = titleWordCount(wanted);
-            titleWords = titleWordCount(title);
-
-            if (wantedWords == 1 && titleWords > 2) return 6;
-            if (titleWords > wantedWords + 3) return 10;
-
-            return 18;
-        }
-
-        return 0;
+        return title == wanted ? 100 : 0;
     }
 
     function normalizedImdbId(value) {
-        var found = (value || '').toString().match(/tt\d+/);
+        var found = (value || '').toString().match(/tt\d+/i);
 
-        return found ? found[0] : '';
+        return found ? found[0].toLowerCase() : '';
     }
 
     function lampaExternalIdScore(sourceCard, item) {
@@ -5021,15 +5447,16 @@
     function pickBestLampaMatch(sourceCard, results) {
         var wantedType = cardType(sourceCard) == 'show' ? 'tv' : 'movie';
         var wantedYear = releaseYear(sourceCard);
-        var strictEpisode = !!sourceCard.plex_episode_label && !wantedYear && typeof sourceCard.id != 'number';
         var wantedTitles = normalizedTitleList([
             cardTitle(sourceCard),
             sourceCard.plex_title,
+            sourceCard.plex_original_title,
             sourceCard.original_title,
             sourceCard.original_name
         ]);
         var best = null;
         var bestScore = -1;
+        var yearlessMatches = {};
 
         results.forEach(function (item) {
             var itemType = item.plex_lampa_type || (item.name || item.original_name ? 'tv' : 'movie');
@@ -5056,16 +5483,17 @@
                 });
             });
 
-            if (!externalScore && titleScore < 18) return;
+            if (!externalScore && titleScore < 100) return;
 
             score += externalScore + titleScore;
 
-            if (wantedYear && itemYear) {
+            if (!externalScore && wantedYear) {
                 var diff = Math.abs(itemYear - wantedYear);
 
-                if (diff === 0) score += 30;
-                else if (diff <= 1) score += 8;
-                else if (diff > 2) score -= 35;
+                if (!itemYear || diff !== 0) return;
+                score += 40;
+            } else if (!externalScore && item && item.id) {
+                yearlessMatches[item.id] = true;
             }
 
             if (item.poster_path) score += 4;
@@ -5077,7 +5505,9 @@
             }
         });
 
-        return bestScore >= (strictEpisode ? 80 : 30) ? best : null;
+        if (!wantedYear && Object.keys(yearlessMatches).length > 1) return null;
+
+        return bestScore >= 100 ? best : null;
     }
 
     function rememberLampaMatch(sourceCard, lampaCard) {
@@ -5512,6 +5942,7 @@
         var isShow = type == 'show' || type == 'season' || isEpisode;
         var showTitle = isEpisode ? episodeShowTitle(item) : '';
         var title = isEpisode ? showTitle || item.title : item.title;
+        var originalTitle = isEpisode ? item.grandparentOriginalTitle || item.showOriginalTitle || '' : metadataOriginalTitle(item);
         var ratingKey = isEpisode ? item.grandparentRatingKey || item.parentRatingKey || item.ratingKey : item.ratingKey;
         var guid = isEpisode ? item.grandparentGuid || item.showGuid || '' : item.guid;
         var year = isEpisode ? episodeSeriesYear(item) : item.grandparentYear || metadataYear(item);
@@ -5525,7 +5956,7 @@
         var card = {
             id: 'plex_' + (ratingKey || item.ratingKey || item.id || Date.now()),
             title: title,
-            original_title: title,
+            original_title: originalTitle || title,
             release_date: isEpisode ? (year ? year + '-01-01' : '') : item.originallyAvailableAt || (year ? year + '-01-01' : ''),
             poster: thumb,
             img: thumb,
@@ -5535,6 +5966,7 @@
             plex_rating_key: ratingKey || item.ratingKey,
             plex_row_kind: rowKind || '',
             plex_title: title,
+            plex_original_title: originalTitle || '',
             source: 'tmdb',
             year: year,
             plex_watched: metadataWatched(item),
@@ -5546,7 +5978,7 @@
 
         if (isShow) {
             card.name = title;
-            card.original_name = title;
+            card.original_name = originalTitle || title;
             card.first_air_date = card.release_date;
         }
 
@@ -5564,7 +5996,9 @@
 
     function attachTmdbIdFromGuids(card, item) {
         var guids = [];
-        var episodeCard = !!(card && card.plex_episode_label);
+        var itemType = normalizePlexType(item && item.type);
+        var sourceType = normalizePlexType(item && item.sourceType);
+        var episodeCard = itemType == 'episode' || sourceType == 'episode';
 
         if (card && card.plex_guid) guids.push(card.plex_guid);
 
@@ -5585,15 +6019,15 @@
         if (item.primaryGuid) guids.push(item.primaryGuid);
 
         guids.forEach(function (guid) {
-            var tmdb = (guid + '').match(/tmdb:\/\/(\d+)/);
-            var imdb = (guid + '').match(/imdb:\/\/(tt\d+)/);
+            var tmdb = (guid + '').match(/tmdb:\/\/(\d+)/i);
+            var imdb = (guid + '').match(/imdb:\/\/(tt\d+)/i);
 
             if (tmdb) {
                 card.id = parseInt(tmdb[1], 10);
                 card.tmdb_id = card.id;
             }
 
-            if (imdb) card.imdb_id = imdb[1];
+            if (imdb) card.imdb_id = imdb[1].toLowerCase();
         });
     }
 
@@ -5610,19 +6044,23 @@
 
         Lampa.Loading.start();
 
-        request('GET', METADATA + '/library/metadata/' + encodeURIComponent(card.plex_rating_key), {
-            includeUserState: 1
-        }, function (data) {
-            var meta = collectMetadata(data)[0] || {};
-
+        loadPlexMetadataDetail(card.plex_rating_key, function (meta) {
+            meta = meta || {};
             attachTmdbIdFromGuids(card, meta);
-            Lampa.Loading.stop();
 
-            if (typeof card.id == 'number') Lampa.Router.call('full', card);
-            else notify('Не найден TMDB id для открытия карточки');
-        }, function () {
-            Lampa.Loading.stop();
-            notify('Не удалось открыть карточку Plex');
+            if (typeof card.id == 'number') {
+                Lampa.Loading.stop();
+                Lampa.Router.call('full', card);
+                return;
+            }
+
+            requestLampaImdbMatch(card, function (found) {
+                Lampa.Loading.stop();
+                Lampa.Router.call('full', attachPlexFields(found, card));
+            }, function () {
+                Lampa.Loading.stop();
+                notify('Не найден TMDB id для открытия карточки');
+            });
         });
     }
 
@@ -5805,6 +6243,7 @@
         }
 
         lampaFullCardCacheMemory = null;
+        plexMetadataDetailCache = {};
 
         Lampa.Storage.set(CACHE_KEY, {});
         Lampa.Storage.set(LEGACY_ROW_CACHE_KEY, {});
