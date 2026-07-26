@@ -2,7 +2,7 @@
     'use strict';
 
     var PLUGIN_ID = 'plex_watchlist';
-    var VERSION = '0.5.18';
+    var VERSION = '0.5.20';
     var WATCHLIST_TITLE = 'Очередь';
     var WATCHLIST_FROM_TITLE = 'Очереди';
     var PLEX = 'https://plex.tv';
@@ -13,9 +13,10 @@
     var WATCHLIST_PATH = '/library/sections/watchlist/all';
     var CACHE_KEY = 'plex_watchlist_cache';
     var LEGACY_ROW_CACHE_KEY = 'plex_watchlist_rows_cache';
-    var ROW_CACHE_KEY = 'plex_watchlist_rows_cache_v2';
+    var ROW_CACHE_KEY = 'plex_watchlist_rows_cache_v3';
     var LAMPA_FULL_CARD_CACHE_KEY = 'plex_watchlist_lampa_full_cards';
     var LAMPA_FULL_CARD_CACHE_SCHEMA = 1;
+    var LAMPA_MATCH_CACHE_SCHEMA = 2;
     var CACHE_SCHEMA = 8;
     var CLIENT_ID_KEY = 'plex_watchlist_client_id';
     var PAGE_SIZE = 20;
@@ -687,16 +688,45 @@
         return (str || '').toString().toLowerCase().replace(/ё/g, 'е').replace(/[^a-zа-я0-9]+/g, ' ').trim();
     }
 
+    function normalizeTitleLeet(str) {
+        return normalizeTitle(str).split(' ').map(function (token) {
+            if (!/[a-z]/.test(token)) return token;
+
+            return token
+                .replace(/0/g, 'o')
+                .replace(/1/g, 'i')
+                .replace(/3/g, 'e')
+                .replace(/4/g, 'a')
+                .replace(/5/g, 's')
+                .replace(/7/g, 'v');
+        }).join(' ');
+    }
+
     function normalizedTitleList(list) {
         var out = [];
         var seen = {};
 
-        list.forEach(function (title) {
-            var normalized = normalizeTitle(title);
+        function add(value) {
+            var normalized = normalizeTitle(value);
 
             if (normalized && !seen[normalized]) {
                 seen[normalized] = true;
                 out.push(normalized);
+            }
+        }
+
+        list.forEach(function (title) {
+            var normalized = normalizeTitle(title);
+            var leet = normalizeTitleLeet(title);
+
+            add(normalized);
+            add(leet);
+
+            if (normalized == 'seven' || normalized == 'se7en' || normalized == 'семь' ||
+                leet == 'seven' || leet == 'семь') {
+                add('seven');
+                add('se7en');
+                add('семь');
             }
         });
 
@@ -1192,7 +1222,7 @@
     function registerStyles() {
         var styleId = PLUGIN_ID + '_styles';
         var css = [
-            '.card__icons-inner .icon--wath,.card__icons-inner .icon--history{',
+            '.card__icons-inner .icon--book,.card__icons-inner .icon--wath,.card__icons-inner .icon--history{',
             'display:none!important;',
             '}',
             '.card__plex-episode{',
@@ -3423,6 +3453,7 @@
 
         if (!element || !card) return;
 
+        removeCardIcon(element, 'book');
         removeCardIcon(element, 'wath');
         removeCardIcon(element, 'history');
         if (card.plex_episode_label) addEpisodeBadge(element, card.plex_episode_label);
@@ -4942,6 +4973,51 @@
         return out;
     }
 
+    function titleWordCount(title) {
+        return (title || '').split(' ').filter(function (part) {
+            return !!part;
+        }).length;
+    }
+
+    function titleMatchScore(wanted, title) {
+        var wantedWords;
+        var titleWords;
+
+        if (!wanted || !title) return 0;
+        if (title == wanted) return 70;
+
+        if (title.indexOf(wanted) >= 0 || wanted.indexOf(title) >= 0) {
+            wantedWords = titleWordCount(wanted);
+            titleWords = titleWordCount(title);
+
+            if (wantedWords == 1 && titleWords > 2) return 6;
+            if (titleWords > wantedWords + 3) return 10;
+
+            return 18;
+        }
+
+        return 0;
+    }
+
+    function normalizedImdbId(value) {
+        var found = (value || '').toString().match(/tt\d+/);
+
+        return found ? found[0] : '';
+    }
+
+    function lampaExternalIdScore(sourceCard, item) {
+        var score = 0;
+        var wantedTmdb = parseInt(sourceCard.tmdb_id || sourceCard.plex_tmdb_id || (typeof sourceCard.id == 'number' ? sourceCard.id : 0), 10) || 0;
+        var itemTmdb = parseInt(item.tmdb_id || item.id || 0, 10) || 0;
+        var wantedImdb = normalizedImdbId(sourceCard.imdb_id || sourceCard.plex_imdb_id);
+        var itemImdb = normalizedImdbId(item.imdb_id || item.imdb || item.external_ids && item.external_ids.imdb_id);
+
+        if (wantedTmdb && itemTmdb && wantedTmdb == itemTmdb) score += 220;
+        if (wantedImdb && itemImdb && wantedImdb == itemImdb) score += 180;
+
+        return score;
+    }
+
     function pickBestLampaMatch(sourceCard, results) {
         var wantedType = cardType(sourceCard) == 'show' ? 'tv' : 'movie';
         var wantedYear = releaseYear(sourceCard);
@@ -4965,6 +5041,8 @@
                 item.original_name
             ]);
             var score = 0;
+            var titleScore = 0;
+            var externalScore = lampaExternalIdScore(sourceCard, item);
 
             if (itemType && itemType != wantedType) return;
 
@@ -4974,10 +5052,13 @@
                 titles.forEach(function (title) {
                     if (!title) return;
 
-                    if (title == wanted) score += 60;
-                    else if (title.indexOf(wanted) >= 0 || wanted.indexOf(title) >= 0) score += 18;
+                    titleScore = Math.max(titleScore, titleMatchScore(wanted, title));
                 });
             });
+
+            if (!externalScore && titleScore < 18) return;
+
+            score += externalScore + titleScore;
 
             if (wantedYear && itemYear) {
                 var diff = Math.abs(itemYear - wantedYear);
@@ -5015,6 +5096,12 @@
         match = {
             id: lampaCard.id,
             type: type,
+            schema: LAMPA_MATCH_CACHE_SCHEMA,
+            title: lampaCard.title || '',
+            original_title: lampaCard.original_title || '',
+            name: lampaCard.name || '',
+            original_name: lampaCard.original_name || '',
+            year: releaseYear(lampaCard),
             time: Date.now()
         };
 
@@ -5029,7 +5116,8 @@
             if (value !== undefined) match[name] = value;
         });
 
-        if (previous && previous.id == lampaCard.id && previous.type == type &&
+        if (previous && previous.schema === LAMPA_MATCH_CACHE_SCHEMA &&
+            previous.id == lampaCard.id && previous.type == type &&
             previous.time && Date.now() - previous.time < LAMPA_MATCH_REFRESH_INTERVAL &&
             categoryFields.every(function (name) {
                 return JSON.stringify(previous[name]) == JSON.stringify(match[name]);
@@ -5256,6 +5344,7 @@
         var categoryFields = ['original_language', 'genre_ids', 'genres'];
 
         if (!found || !found.id) return null;
+        if (found.schema !== LAMPA_MATCH_CACHE_SCHEMA) return null;
 
         var out = {
             id: found.id,
